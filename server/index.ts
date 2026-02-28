@@ -14,6 +14,8 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.SERVER_PORT || 3001;
+const redactConnectionString = (value: string) =>
+    value.replace(/:\/\/[^:/@]+(?::[^/@]+)?@/, '://***:***@');
 
 // Middleware
 app.use(cors({
@@ -68,5 +70,6 @@ app.get('/api/health', async (_req, res) => {
 app.listen(PORT, () => {
     console.log(`\n🚀 Commy API server running on http://localhost:${PORT}`);
     console.log(`📁 Storage directory: ${storagePath}`);
-    console.log(`💾 Database: ${process.env.DATABASE_URL || 'postgresql://localhost:5432/commy_dev'}\n`);
+    const databaseUrl = process.env.DATABASE_URL || 'postgresql://localhost:5432/commy_dev';
+    console.log(`💾 Database: ${redactConnectionString(databaseUrl)}\n`);
 });
