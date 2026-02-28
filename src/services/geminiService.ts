@@ -4,48 +4,48 @@ import { AspectRatio, ProjectSettings, ReferenceFile, TTSVoice, AdProject, Dialo
 // --- AUDIO UTILITIES (PCM to WAV) ---
 
 const writeString = (view: DataView, offset: number, string: string) => {
-  for (let i = 0; i < string.length; i++) {
-    view.setUint8(offset + i, string.charCodeAt(i));
-  }
+    for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+    }
 };
 
 const createWavHeader = (sampleRate: number, numChannels: number, numFrames: number) => {
-  const blockAlign = numChannels * 2; // 16-bit = 2 bytes
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = numFrames * blockAlign;
-  const buffer = new ArrayBuffer(44);
-  const view = new DataView(buffer);
+    const blockAlign = numChannels * 2; // 16-bit = 2 bytes
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = numFrames * blockAlign;
+    const buffer = new ArrayBuffer(44);
+    const view = new DataView(buffer);
 
-  // RIFF chunk descriptor
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(view, 8, 'WAVE');
+    // RIFF chunk descriptor
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, 'WAVE');
 
-  // fmt sub-chunk
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
-  view.setUint16(20, 1, true); // AudioFormat (1 for PCM)
-  view.setUint16(22, numChannels, true); // NumChannels
-  view.setUint32(24, sampleRate, true); // SampleRate
-  view.setUint32(28, byteRate, true); // ByteRate
-  view.setUint16(32, blockAlign, true); // BlockAlign
-  view.setUint16(34, 16, true); // BitsPerSample
+    // fmt sub-chunk
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+    view.setUint16(20, 1, true); // AudioFormat (1 for PCM)
+    view.setUint16(22, numChannels, true); // NumChannels
+    view.setUint32(24, sampleRate, true); // SampleRate
+    view.setUint32(28, byteRate, true); // ByteRate
+    view.setUint16(32, blockAlign, true); // BlockAlign
+    view.setUint16(34, 16, true); // BitsPerSample
 
-  // data sub-chunk
-  writeString(view, 36, 'data');
-  view.setUint32(40, dataSize, true);
+    // data sub-chunk
+    writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
 
-  return buffer;
+    return buffer;
 };
 
 const base64ToUint8Array = (base64: string) => {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
+    const binaryString = atob(base64);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
 };
 
 const pcmToWavBlob = (pcmData: Uint8Array, sampleRate: number, channels: number): Blob => {
@@ -72,140 +72,143 @@ const parseDataUrl = (dataUrl: string) => {
     }
 };
 
-// --- HELPER: FETCH BLOB AND CONVERT TO BASE64 ---
-const urlToBase64 = async (url: string): Promise<string> => {
-    const response = await fetch(url);
-    const blob = await response.blob();
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-            const result = reader.result as string;
-            const base64 = result.includes(',') ? result.split(',')[1] : result;
-            resolve(base64);
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-    });
+const toErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
+const hasApiKey = () => Boolean(process.env.API_KEY);
+
+const parsePcmMimeType = (mimeType?: string) => {
+    if (!mimeType) return null;
+    const lowerMime = mimeType.toLowerCase();
+    if (!lowerMime.includes('l16') && !lowerMime.includes('pcm')) return null;
+
+    const rateMatch = lowerMime.match(/rate=(\d+)/);
+    const channelMatch = lowerMime.match(/channels=(\d+)/);
+    return {
+        sampleRate: rateMatch ? Number(rateMatch[1]) : 24000,
+        channels: channelMatch ? Number(channelMatch[1]) : 1,
+    };
 };
 
 
 // --- 1. The Creative Director Agent ---
 
 const adPlanSchema: Schema = {
-  type: Type.OBJECT,
-  properties: {
-    title: { type: Type.STRING },
-    concept: { type: Type.STRING },
-    musicMood: { type: Type.STRING },
-    characterProfile: { type: Type.STRING, description: "Detailed physical description of the main character to be used as a fallback." },
-    visualStyleProfile: { type: Type.STRING, description: "Detailed world description." },
-    fullScript: { type: Type.STRING },
-    script: {
-        type: Type.ARRAY,
-        items: {
-            type: Type.OBJECT,
-            properties: {
-                speaker: { type: Type.STRING },
-                text: { type: Type.STRING }
+    type: Type.OBJECT,
+    properties: {
+        title: { type: Type.STRING },
+        concept: { type: Type.STRING },
+        musicMood: { type: Type.STRING },
+        characterProfile: { type: Type.STRING, description: "Detailed physical description of the main character to be used as a fallback." },
+        visualStyleProfile: { type: Type.STRING, description: "Detailed world description." },
+        fullScript: { type: Type.STRING },
+        script: {
+            type: Type.ARRAY,
+            items: {
+                type: Type.OBJECT,
+                properties: {
+                    speaker: { type: Type.STRING },
+                    text: { type: Type.STRING }
+                }
             }
-        }
-    },
-    scenes: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          id: { type: Type.STRING },
-          order: { type: Type.INTEGER },
-          duration: { type: Type.INTEGER },
-          // NEW RICH STRUCTURE
-          character: {
-              type: Type.OBJECT,
-              properties: {
-                  name: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  hair: { type: Type.STRING },
-                  face: { type: Type.STRING },
-                  wardrobe: { type: Type.STRING }
-              },
-              required: ["description", "wardrobe"]
-          },
-          environment: {
-              type: Type.OBJECT,
-              properties: {
-                  location: { type: Type.STRING },
-                  look: { type: Type.STRING },
-                  lighting: { type: Type.STRING },
-                  background_motion: { type: Type.STRING }
-              },
-              required: ["location", "look", "lighting"]
-          },
-          camera: {
-              type: Type.OBJECT,
-              properties: {
-                  framing: { type: Type.STRING },
-                  movement: { type: Type.STRING },
-                  notes: { type: Type.STRING }
-              },
-              required: ["framing", "movement"]
-          },
-          action_blocking: {
-              type: Type.ARRAY,
-              items: {
-                  type: Type.OBJECT,
-                  properties: {
-                      time_window: { type: Type.STRING },
-                      notes: { type: Type.STRING }
-                  }
-              }
-          },
-          visual_summary_prompt: { type: Type.STRING },
-          
-          textOverlay: { type: Type.STRING },
-          overlayConfig: {
-            type: Type.OBJECT,
-            properties: {
-              position: { type: Type.STRING, enum: ['center', 'top', 'bottom', 'top-left', 'top-right', 'bottom-left', 'bottom-right'] },
-              size: { type: Type.STRING, enum: ['small', 'medium', 'large', 'xl'] }
-            },
-            required: ["position", "size"]
-          }
         },
-        required: ["id", "order", "duration", "character", "environment", "camera", "visual_summary_prompt", "action_blocking"]
-      }
+        scenes: {
+            type: Type.ARRAY,
+            items: {
+                type: Type.OBJECT,
+                properties: {
+                    id: { type: Type.STRING },
+                    order: { type: Type.INTEGER },
+                    duration: { type: Type.INTEGER },
+                    // NEW RICH STRUCTURE
+                    character: {
+                        type: Type.OBJECT,
+                        properties: {
+                            name: { type: Type.STRING },
+                            description: { type: Type.STRING },
+                            hair: { type: Type.STRING },
+                            face: { type: Type.STRING },
+                            wardrobe: { type: Type.STRING }
+                        },
+                        required: ["description", "wardrobe"]
+                    },
+                    environment: {
+                        type: Type.OBJECT,
+                        properties: {
+                            location: { type: Type.STRING },
+                            look: { type: Type.STRING },
+                            lighting: { type: Type.STRING },
+                            background_motion: { type: Type.STRING }
+                        },
+                        required: ["location", "look", "lighting"]
+                    },
+                    camera: {
+                        type: Type.OBJECT,
+                        properties: {
+                            framing: { type: Type.STRING },
+                            movement: { type: Type.STRING },
+                            notes: { type: Type.STRING }
+                        },
+                        required: ["framing", "movement"]
+                    },
+                    action_blocking: {
+                        type: Type.ARRAY,
+                        items: {
+                            type: Type.OBJECT,
+                            properties: {
+                                time_window: { type: Type.STRING },
+                                notes: { type: Type.STRING }
+                            }
+                        }
+                    },
+                    visual_summary_prompt: { type: Type.STRING },
+
+                    textOverlay: { type: Type.STRING },
+                    overlayConfig: {
+                        type: Type.OBJECT,
+                        properties: {
+                            position: { type: Type.STRING, enum: ['center', 'top', 'bottom', 'top-left', 'top-right', 'bottom-left', 'bottom-right'] },
+                            size: { type: Type.STRING, enum: ['small', 'medium', 'large', 'xl'] }
+                        },
+                        required: ["position", "size"]
+                    }
+                },
+                required: ["id", "order", "duration", "character", "environment", "camera", "visual_summary_prompt", "action_blocking"]
+            }
+        },
+        ffmpegCommand: { type: Type.STRING }
     },
-    ffmpegCommand: { type: Type.STRING }
-  },
-  required: ["title", "concept", "scenes", "musicMood", "fullScript"]
+    required: ["title", "concept", "scenes", "musicMood", "fullScript"]
 };
 
 export const generateAdPlan = async (
-  prompt: string,
-  settings: ProjectSettings,
-  referenceFiles: ReferenceFile[]
+    prompt: string,
+    settings: ProjectSettings,
+    referenceFiles: ReferenceFile[]
 ): Promise<any> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const model = "gemini-3-pro-preview";
-  
-  const contentParts: any[] = [];
-  
-  let textContext = "REFERENCE MATERIALS:\n";
-  let hasLinks = false;
+    if (!hasApiKey()) {
+        throw new Error("Missing API key. Set GEMINI_API_KEY in .env and restart the app.");
+    }
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const model = "gemini-3-pro-preview";
 
-  for (const file of referenceFiles) {
-      if (file.type === 'image' || file.type === 'pdf') {
-          const base64 = file.content.includes(',') ? file.content.split(',')[1] : file.content;
-          const mimeType = file.mimeType || (file.type === 'image' ? 'image/png' : 'application/pdf');
-          contentParts.push({ inlineData: { mimeType: mimeType, data: base64 } });
-      } else if (file.type === 'link') {
-          hasLinks = true;
-          textContext += `- YouTube/Web Link: ${file.content}\n`;
-      } else {
-          textContext += `- File: ${file.name}: ${file.content.substring(0, 500)}...\n`;
-      }
-  }
+    const contentParts: any[] = [];
 
-  const settingsContext = `
+    let textContext = "REFERENCE MATERIALS:\n";
+    let hasLinks = false;
+
+    for (const file of referenceFiles) {
+        if (file.type === 'image' || file.type === 'pdf') {
+            const base64 = file.content.includes(',') ? file.content.split(',')[1] : file.content;
+            const mimeType = file.mimeType || (file.type === 'image' ? 'image/png' : 'application/pdf');
+            contentParts.push({ inlineData: { mimeType: mimeType, data: base64 } });
+        } else if (file.type === 'link') {
+            hasLinks = true;
+            textContext += `- YouTube/Web Link: ${file.content}\n`;
+        } else {
+            textContext += `- File: ${file.name}: ${file.content.substring(0, 500)}...\n`;
+        }
+    }
+
+    const settingsContext = `
     SETTINGS:
     - Mode: ${settings.mode}
     - Aspect Ratio: ${settings.aspectRatio}
@@ -214,7 +217,7 @@ export const generateAdPlan = async (
     - Music Theme: ${settings.musicTheme}
   `;
 
-  const fullPromptText = `
+    const fullPromptText = `
     ${textContext}
     ${settingsContext}
     USER REQUEST: "${prompt}"
@@ -233,29 +236,45 @@ export const generateAdPlan = async (
     - Script: 60-70 words.
   `;
 
-  contentParts.push({ text: fullPromptText });
+    contentParts.push({ text: fullPromptText });
 
-  try {
-    const requestConfig: any = {
-      systemInstruction: "You are an elite Film Director. You break down scenes into granular technical components (Lighting, Wardrobe, Camera, Blocking) to ensure perfect production consistency.",
-      responseMimeType: "application/json",
-      responseSchema: adPlanSchema,
-    };
+    try {
+        console.log("[Gemini][Planning] Generating ad plan", {
+            model,
+            referenceFileCount: referenceFiles.length,
+            hasLinks,
+            mode: settings.mode,
+            aspectRatio: settings.aspectRatio,
+        });
+        const requestConfig: any = {
+            systemInstruction: "You are an elite Film Director. You break down scenes into granular technical components (Lighting, Wardrobe, Camera, Blocking) to ensure perfect production consistency.",
+            responseMimeType: "application/json",
+            responseSchema: adPlanSchema,
+        };
 
-    if (hasLinks) {
-        requestConfig.tools = [{ googleSearch: {} }];
+        if (hasLinks) {
+            requestConfig.tools = [{ googleSearch: {} }];
+        }
+
+        const response = await ai.models.generateContent({
+            model,
+            contents: [{ parts: contentParts }],
+            config: requestConfig
+        });
+        const parsed = JSON.parse(response.text || "{}");
+        console.log("[Gemini][Planning] Ad plan generated", {
+            sceneCount: Array.isArray(parsed?.scenes) ? parsed.scenes.length : 0,
+            hasMusicMood: Boolean(parsed?.musicMood),
+        });
+        return parsed;
+    } catch (error) {
+        console.error("[Gemini][Planning] Ad plan generation failed", {
+            model,
+            promptPreview: prompt.slice(0, 160),
+            error: toErrorMessage(error),
+        }, error);
+        throw error;
     }
-
-    const response = await ai.models.generateContent({
-      model,
-      contents: [{ parts: contentParts }],
-      config: requestConfig
-    });
-    return JSON.parse(response.text || "{}");
-  } catch (error) {
-    console.error("Ad Plan Generation Failed:", error);
-    throw error;
-  }
 };
 
 // --- 2. Storyboard Generation (UPDATED: Uses Rich Scene Data) ---
@@ -265,11 +284,15 @@ export const generateStoryboardImage = async (
     aspectRatio: AspectRatio,
     visualAnchorDataUrl?: string,
 ): Promise<string | null> => {
+    if (!hasApiKey()) {
+        console.error("[Gemini][Storyboard] Missing API key.");
+        return null;
+    }
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const aspect = aspectRatio === AspectRatio.SixteenNine ? '16:9' : '9:16';
-    
+
     const parts: any[] = [];
-    
+
     // 1. Inject Visual Anchor
     if (visualAnchorDataUrl) {
         const parsed = parseDataUrl(visualAnchorDataUrl);
@@ -285,25 +308,32 @@ export const generateStoryboardImage = async (
     const prompt = `
       Create a photorealistic cinematic shot.
       
-      [CAMERA]: ${scene.camera.framing}, ${scene.camera.movement}. ${scene.camera.notes}
+      [CAMERA]: ${scene.camera?.framing || 'Cinematic framing'}, ${scene.camera?.movement || 'Static'}. ${scene.camera?.notes || ''}
       
-      [LIGHTING & ATMOSPHERE]: ${scene.environment.lighting}, ${scene.environment.look}.
+      [LIGHTING & ATMOSPHERE]: ${scene.environment?.lighting || 'Natural light'}, ${scene.environment?.look || 'Realistic'}.
       
-      [LOCATION]: ${scene.environment.location}.
+      [LOCATION]: ${scene.environment?.location || 'Unknown'}.
       
-      [SUBJECT]: ${scene.character.description}. 
-      - Hair: ${scene.character.hair}
-      - Wardrobe: ${scene.character.wardrobe}
-      - Face: ${scene.character.face}
+      [SUBJECT]: ${scene.character?.description || 'A person'}. 
+      - Hair: ${scene.character?.hair || 'Natural'}
+      - Wardrobe: ${scene.character?.wardrobe || 'Casual'}
+      - Face: ${scene.character?.face || 'Neutral'}
       
-      [ACTION]: ${scene.action_blocking.map(a => a.notes).join('. ')}
+      [ACTION]: ${scene.action_blocking ? scene.action_blocking.map(a => a.notes).join('. ') : 'Static shot'}
       
       [STYLE]: High-end commercial, 8k resolution, highly detailed.
     `;
-    
+
     parts.push({ text: prompt });
 
     try {
+        console.log("[Gemini][Storyboard] Generating scene image", {
+            sceneId: scene.id,
+            order: scene.order,
+            model: 'gemini-3-pro-image-preview',
+            aspect,
+            hasVisualAnchor: Boolean(visualAnchorDataUrl),
+        });
         const response = await ai.models.generateContent({
             model: 'gemini-3-pro-image-preview',
             contents: { parts },
@@ -312,14 +342,23 @@ export const generateStoryboardImage = async (
             }
         });
 
-        for (const part of response.candidates[0].content.parts) {
+        const contentParts = response.candidates?.[0]?.content?.parts || [];
+        for (const part of contentParts) {
             if (part.inlineData) {
+                console.log("[Gemini][Storyboard] Scene image generated", {
+                    sceneId: scene.id,
+                    mimeType: part.inlineData.mimeType,
+                });
                 return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
             }
         }
+        console.warn("[Gemini][Storyboard] No image returned for scene", { sceneId: scene.id });
         return null;
     } catch (e) {
-        console.error("Storyboard Image Generation Failed:", e);
+        console.error("[Gemini][Storyboard] Storyboard generation failed", {
+            sceneId: scene.id,
+            error: toErrorMessage(e),
+        }, e);
         return null;
     }
 };
@@ -330,12 +369,19 @@ const internalGenerateVideo = async (
     ai: GoogleGenAI,
     prompt: string,
     aspect: string,
+    attemptLabel: string,
     imageInput?: { base64: string, mimeType: string }
 ): Promise<string | null> => {
     try {
+        console.log("[Veo] Starting video generation attempt", {
+            attemptLabel,
+            model: 'veo-3.1-fast-generate-preview',
+            aspect,
+            hasImageInput: Boolean(imageInput),
+        });
         let requestPayload: any = {
             model: 'veo-3.1-fast-generate-preview',
-            prompt: prompt, 
+            prompt: prompt,
             config: { numberOfVideos: 1, resolution: '720p', aspectRatio: aspect }
         };
 
@@ -344,98 +390,167 @@ const internalGenerateVideo = async (
         }
 
         let operation = await ai.models.generateVideos(requestPayload);
+        let polls = 0;
         while (!operation.done) {
+            polls += 1;
+            if (polls > 90) {
+                console.warn("[Veo] Video generation timed out while polling.", { attemptLabel, polls });
+                return null;
+            }
             await new Promise(resolve => setTimeout(resolve, 5000));
             operation = await ai.operations.getVideosOperation({ operation: operation });
         }
 
         const videoUri = operation.response?.generatedVideos?.[0]?.video?.uri;
-        if (!videoUri) return null;
+        if (!videoUri) {
+            console.warn("[Veo] Generation completed without a video URI.", { attemptLabel });
+            return null;
+        }
 
         const response = await fetch(`${videoUri}&key=${process.env.API_KEY}`);
+        if (!response.ok) {
+            console.error("[Veo] Failed downloading generated video.", {
+                attemptLabel,
+                status: response.status,
+                statusText: response.statusText,
+            });
+            return null;
+        }
         const blob = await response.blob();
+        console.log("[Veo] Video generation attempt succeeded.", {
+            attemptLabel,
+            sizeBytes: blob.size,
+        });
         return URL.createObjectURL(blob);
     } catch (error) {
+        console.error("[Veo] Video generation attempt failed.", {
+            attemptLabel,
+            error: toErrorMessage(error),
+        }, error);
         return null;
     }
 }
 
 export const generateVideoClip = async (
-  scene: Scene,
-  aspectRatio: AspectRatio,
-  sourceImageDataUrl?: string
+    scene: Scene,
+    aspectRatio: AspectRatio,
+    sourceImageDataUrl?: string
 ): Promise<string | null> => {
+    if (!hasApiKey()) {
+        console.error("[Veo] Missing API key.");
+        return null;
+    }
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const aspect = aspectRatio === AspectRatio.SixteenNine ? '16:9' : '9:16';
-    
+    const actionNotes = Array.isArray(scene.action_blocking) ? scene.action_blocking.map(a => a.notes).join('. ') : '';
+
     // Construct a rich prompt for Veo as well, even if using image input
     const veoPrompt = `
       Cinematic video.
-      ${scene.action_blocking.map(a => a.notes).join('. ')}
-      Camera: ${scene.camera.movement}.
-      Lighting: ${scene.environment.lighting}.
+      ${actionNotes || scene.visual_summary_prompt || 'Subject performs action in a cinematic commercial style.'}
+      Camera: ${scene.camera?.movement || 'smooth tracking'}.
+      Lighting: ${scene.environment?.lighting || 'high-contrast cinematic'}.
     `;
 
     // ATTEMPT 1: Image-to-Video
     if (sourceImageDataUrl) {
         const parsed = parseDataUrl(sourceImageDataUrl);
         if (parsed) {
-            const videoUrl = await internalGenerateVideo(ai, veoPrompt, aspect, parsed);
+            const videoUrl = await internalGenerateVideo(ai, veoPrompt, aspect, `scene-${scene.id}-image2video`, parsed);
             if (videoUrl) return videoUrl;
+            console.warn("[Veo] Image-to-video attempt failed, falling back to text-to-video.", { sceneId: scene.id });
+        } else {
+            console.warn("[Veo] Storyboard image could not be parsed. Falling back to text-to-video.", { sceneId: scene.id });
         }
     }
 
     // ATTEMPT 2: Text-to-Video (Fallback using the visual summary)
-    return await internalGenerateVideo(ai, scene.visual_summary_prompt + " (Cinematic, Photorealistic)", aspect, undefined);
+    return await internalGenerateVideo(
+        ai,
+        `${scene.visual_summary_prompt || veoPrompt} (Cinematic, Photorealistic)`,
+        aspect,
+        `scene-${scene.id}-text2video`,
+        undefined
+    );
 };
 
 // --- 4. TTS Generation (PCM to WAV) ---
 
 export const generateVoiceover = async (text: string, voice: TTSVoice, dialogue?: DialogueLine[]): Promise<string | null> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  if (!text && (!dialogue || dialogue.length === 0)) return null;
+    if (!hasApiKey()) {
+        console.error("[Gemini][TTS] Missing API key.");
+        return null;
+    }
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    if (!text && (!dialogue || dialogue.length === 0)) return null;
 
-  try {
-    let config: any = { responseModalities: [Modality.AUDIO] };
-    let promptContent = "";
+    try {
+        let config: any = { responseModalities: [Modality.AUDIO] };
+        let promptContent = "";
 
-    if (dialogue && dialogue.length > 0) {
-        const uniqueSpeakers = Array.from(new Set(dialogue.map(d => d.speaker)));
-        if (uniqueSpeakers.length > 1) {
-            const availableVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr', 'Aoede'];
-            const speakerVoiceConfigs = uniqueSpeakers.map((speaker, idx) => ({
-                speaker: speaker,
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: availableVoices[idx % availableVoices.length] } }
-            }));
+        if (dialogue && dialogue.length > 0) {
+            const uniqueSpeakers = Array.from(new Set(dialogue.map(d => d.speaker)));
+            if (uniqueSpeakers.length > 1) {
+                const availableVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr', 'Aoede'];
+                const speakerVoiceConfigs = uniqueSpeakers.map((speaker, idx) => ({
+                    speaker: speaker,
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: availableVoices[idx % availableVoices.length] } }
+                }));
 
-            config.speechConfig = { multiSpeakerVoiceConfig: { speakerVoiceConfigs: speakerVoiceConfigs } };
-            promptContent = dialogue.map(d => `${d.speaker}: ${d.text}`).join('\n');
+                config.speechConfig = { multiSpeakerVoiceConfig: { speakerVoiceConfigs: speakerVoiceConfigs } };
+                promptContent = dialogue.map(d => `${d.speaker}: ${d.text}`).join('\n');
+            } else {
+                promptContent = text;
+                config.speechConfig = { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } };
+            }
         } else {
             promptContent = text;
             config.speechConfig = { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } };
         }
-    } else {
-        promptContent = text;
-        config.speechConfig = { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } };
-    }
 
-    const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: promptContent }] }],
-        config: config
-    });
+        console.log("[Gemini][TTS] Generating voiceover", {
+            model: "gemini-2.5-flash-preview-tts",
+            textLength: promptContent.length,
+            isMultiSpeaker: Boolean(dialogue && dialogue.length > 0 && new Set(dialogue.map(d => d.speaker)).size > 1),
+        });
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash-preview-tts",
+            contents: [{ parts: [{ text: promptContent }] }],
+            config: config
+        });
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (base64Audio) {
-        const pcmData = base64ToUint8Array(base64Audio);
-        const wavBlob = pcmToWavBlob(pcmData, 24000, 1);
-        return URL.createObjectURL(wavBlob);
+        const inlineAudio = response.candidates?.[0]?.content?.parts?.find((part: any) => part.inlineData)?.inlineData;
+        const base64Audio = inlineAudio?.data;
+        if (base64Audio) {
+            const rawAudio = base64ToUint8Array(base64Audio);
+            const pcmConfig = parsePcmMimeType(inlineAudio?.mimeType);
+
+            if (pcmConfig) {
+                const wavBlob = pcmToWavBlob(rawAudio, pcmConfig.sampleRate, pcmConfig.channels);
+                console.log("[Gemini][TTS] Voiceover generated (PCM->WAV).", {
+                    mimeType: inlineAudio?.mimeType,
+                    sampleRate: pcmConfig.sampleRate,
+                    channels: pcmConfig.channels,
+                    sizeBytes: wavBlob.size,
+                });
+                return URL.createObjectURL(wavBlob);
+            }
+
+            const audioBlob = new Blob([rawAudio], { type: inlineAudio?.mimeType || 'audio/wav' });
+            console.log("[Gemini][TTS] Voiceover generated (direct blob).", {
+                mimeType: inlineAudio?.mimeType,
+                sizeBytes: audioBlob.size,
+            });
+            return URL.createObjectURL(audioBlob);
+        }
+        console.warn("[Gemini][TTS] No inline audio payload returned.");
+        return null;
+    } catch (error) {
+        console.error("[Gemini][TTS] Voiceover generation failed.", {
+            error: toErrorMessage(error),
+        }, error);
+        return null;
     }
-    return null;
-  } catch (error) {
-      console.error("TTS Error", error);
-      return null;
-  }
 };
 
 // --- 5. Music Generation (Lyria WebSocket Implementation) ---
@@ -458,16 +573,22 @@ const getFallbackMusic = (mood: string) => {
 
 export const generateMusic = async (moodDescription: string, durationSeconds: number = 30): Promise<string | null> => {
     const triggerFallback = (reason: string) => {
-        console.warn(`Falling back to stock music. Reason: ${reason}`);
+        console.warn(`[Lyria] Falling back to stock music. Reason: ${reason}`);
         return getFallbackMusic(moodDescription);
     };
 
+    if (!hasApiKey()) {
+        return triggerFallback("Missing API key");
+    }
+
     return new Promise((resolve) => {
         let hasResolved = false;
+        let chunkCount = 0;
+        let receivedBytes = 0;
         const safetyTimeout = setTimeout(() => {
-            if (!hasResolved) { 
-                hasResolved = true; 
-                resolve(triggerFallback("Lyria Timeout")); 
+            if (!hasResolved) {
+                hasResolved = true;
+                resolve(triggerFallback("Lyria Timeout"));
             }
         }, (durationSeconds * 1000) + 15000);
 
@@ -476,21 +597,33 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
             const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateMusic?key=${apiKey}`;
             const ws = new WebSocket(wsUrl);
             const chunks: Uint8Array[] = [];
+            console.log("[Lyria] Opening realtime music socket.", {
+                durationSeconds,
+                moodPreview: moodDescription.slice(0, 100),
+            });
 
             ws.onopen = () => {
                 // 1. Send Setup
                 ws.send(JSON.stringify({
                     setup: { model: 'models/lyria-realtime-exp' }
                 }));
+                console.log("[Lyria] Socket open, setup sent.");
             };
 
             ws.onmessage = async (event) => {
                 let msg;
-                if (event.data instanceof Blob) {
-                    const text = await event.data.text();
-                    msg = JSON.parse(text);
-                } else {
-                    msg = JSON.parse(event.data);
+                try {
+                    if (event.data instanceof Blob) {
+                        const text = await event.data.text();
+                        msg = JSON.parse(text);
+                    } else {
+                        msg = JSON.parse(event.data);
+                    }
+                } catch (parseErr) {
+                    console.warn("[Lyria] Failed to parse websocket message.", {
+                        error: toErrorMessage(parseErr),
+                    });
+                    return;
                 }
 
                 if (msg.setupComplete) {
@@ -500,55 +633,73 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                             musicGenerationMode: 'QUALITY'
                         }
                     }));
-                    
+
                     // 3. Send Prompts
                     ws.send(JSON.stringify({
                         clientContent: {
                             weightedPrompts: [{ text: moodDescription, weight: 1.0 }]
                         }
                     }));
-                    
+
                     // 4. Send Play
                     ws.send(JSON.stringify({
                         playbackControl: 'PLAY'
                     }));
+                    console.log("[Lyria] Setup complete, config/prompts/play sent.");
                 } else if (msg.serverContent && msg.serverContent.audioChunks) {
                     for (const chunk of msg.serverContent.audioChunks) {
-                        chunks.push(base64ToUint8Array(chunk.data));
+                        try {
+                            const bytes = base64ToUint8Array(chunk.data);
+                            chunks.push(bytes);
+                            chunkCount += 1;
+                            receivedBytes += bytes.length;
+                        } catch (chunkErr) {
+                            console.warn("[Lyria] Failed to decode audio chunk.", {
+                                error: toErrorMessage(chunkErr),
+                            });
+                        }
                     }
                 } else if (msg.warning) {
-                    console.warn("Lyria Warning:", msg.warning);
+                    console.warn("[Lyria] Warning:", msg.warning);
                 }
             };
 
             ws.onerror = (err) => {
-                console.error("Lyria WS Error:", err);
-                if (!hasResolved) { 
-                    hasResolved = true; 
-                    clearTimeout(safetyTimeout); 
-                    resolve(triggerFallback("WebSocket Error")); 
-                }
-            };
-
-            ws.onclose = () => {
+                console.error("[Lyria] WebSocket error.", err);
                 if (!hasResolved) {
                     hasResolved = true;
                     clearTimeout(safetyTimeout);
+                    resolve(triggerFallback("WebSocket Error"));
+                }
+            };
+
+            ws.onclose = (event) => {
+                if (!hasResolved) {
+                    hasResolved = true;
+                    clearTimeout(safetyTimeout);
+                    console.log("[Lyria] Socket closed.", {
+                        code: event.code,
+                        reason: event.reason,
+                        wasClean: event.wasClean,
+                        chunkCount,
+                        receivedBytes,
+                    });
                     if (chunks.length === 0) {
                         resolve(triggerFallback("No Data Received"));
                         return;
                     }
-                    
+
                     const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
                     const combinedPcm = new Uint8Array(totalLength);
                     let offset = 0;
-                    for (const chunk of chunks) { 
-                        combinedPcm.set(chunk, offset); 
-                        offset += chunk.length; 
+                    for (const chunk of chunks) {
+                        combinedPcm.set(chunk, offset);
+                        offset += chunk.length;
                     }
-                    
+
                     // Lyria typically outputs 44.1kHz or 48kHz PCM. Assuming 48kHz stereo.
-                    const wavBlob = pcmToWavBlob(combinedPcm, 48000, 2); 
+                    const wavBlob = pcmToWavBlob(combinedPcm, 48000, 2);
+                    console.log("[Lyria] Music generated.", { sizeBytes: wavBlob.size, chunkCount });
                     resolve(URL.createObjectURL(wavBlob));
                 }
             };
@@ -562,10 +713,10 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
             }, durationSeconds * 1000);
 
         } catch (e) {
-            if (!hasResolved) { 
-                hasResolved = true; 
-                clearTimeout(safetyTimeout); 
-                resolve(triggerFallback(`Exception: ${e}`)); 
+            if (!hasResolved) {
+                hasResolved = true;
+                clearTimeout(safetyTimeout);
+                resolve(triggerFallback(`Exception: ${e}`));
             }
         }
     });
@@ -573,9 +724,9 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
 
 // --- 6. Chat Helper ---
 export const sendChatMessage = async (
-    history: any[], 
-    message: string, 
-    project?: AdProject, 
+    history: any[],
+    message: string,
+    project?: AdProject,
     attachments?: ChatAttachment[]
 ) => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -597,16 +748,16 @@ export const sendChatMessage = async (
 
     parts.push({ text: message });
     let systemInstruction = "You are a helpful AI Creative Director.";
-    
+
     const config: any = { systemInstruction: systemInstruction };
-    if (hasLinks) config.tools = [{googleSearch: {}}];
+    if (hasLinks) config.tools = [{ googleSearch: {} }];
 
     const chat = ai.chats.create({
-        model: 'gemini-3-pro-preview', 
+        model: 'gemini-3-pro-preview',
         history: history,
         config: config
     });
-    
+
     const result = await chat.sendMessage({ message: parts });
     return result.text;
 }
