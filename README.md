@@ -26,9 +26,14 @@ It is built for fast demo and hackathon iteration with full local integration (f
 9. [Environment Variables](#environment-variables)
 10. [Scripts](#scripts)
 11. [Testing](#testing)
-12. [Troubleshooting](#troubleshooting)
-13. [Security Notes](#security-notes)
-14. [Repository Map](#repository-map)
+12. [Development Process](#development-process)
+13. [Change And Release Process](#change-and-release-process)
+14. [Expansion Guide](#expansion-guide)
+15. [Troubleshooting](#troubleshooting)
+16. [Security Notes](#security-notes)
+17. [Repository Map](#repository-map)
+18. [Contributing](#contributing)
+19. [License](#license)
 
 ---
 
@@ -386,6 +391,112 @@ This catches TypeScript and bundle breakages before shipping.
 
 ---
 
+## Development Process
+
+This is the recommended engineering loop for safe iteration.
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                  DAILY DEV PROCESS                                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 1) Pull latest main                                                                           │
+│     git pull --rebase origin main                                                             │
+│                                                                                               │
+│ 2) Start full integration stack                                                               │
+│     npm run dev                                                                               │
+│                                                                                               │
+│ 3) Implement small, testable changes                                                          │
+│     - UI behavior                                                                             │
+│     - API contract                                                                            │
+│     - pipeline/error logs                                                                     │
+│                                                                                               │
+│ 4) Validate                                                                                    │
+│     npm test                                                                                  │
+│     npm run build                                                                             │
+│                                                                                               │
+│ 5) Manual flow check                                                                          │
+│     - prompt -> plan -> generate -> persist -> refresh -> export -> download                 │
+│                                                                                               │
+│ 6) Commit focused diff                                                                        │
+│     git add ... && git commit -m \"...\"                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Process checklist for each feature/fix
+- Add or update pipeline diagnostics for the changed path.
+- Confirm DB persistence survives refresh.
+- Confirm mobile + desktop rendering.
+- Confirm no regression in chat-triggered generation behavior.
+- Confirm export/download path still works when clips exist.
+
+---
+
+## Change And Release Process
+
+### Branching strategy
+- `main` is deployable and demo-ready.
+- Use short-lived feature branches for larger work.
+- Keep commits scoped by concern (`ui`, `pipeline`, `api`, `docs`).
+
+### Pre-merge release gate
+
+```text
+[Code Change]
+      |
+      v
+[npm test] ---- fail ----> fix + rerun
+      |
+      v
+[npm run build] -- fail --> fix + rerun
+      |
+      v
+[Manual E2E smoke]
+  - create project
+  - generate assets
+  - refresh (persistence)
+  - export/download
+      |
+      v
+[Merge/Push]
+```
+
+### Hotfix protocol (hackathon-safe)
+1. Reproduce quickly with exact UI flow.
+2. Add logging where state transitions happen.
+3. Patch smallest viable fix.
+4. Re-run tests/build.
+5. Verify one clean E2E run.
+6. Commit with clear scope and reason.
+
+---
+
+## Expansion Guide
+
+This section describes how to extend Commy without breaking core flows.
+
+### Add a new generation provider
+1. Implement provider call in `src/services/geminiService.ts` (or a new service module).
+2. Return structured diagnostics in the same shape used by pipeline logs.
+3. Integrate the provider into `src/services/generationPipeline.ts`.
+4. Ensure fallback behavior exists for quota/network failures.
+5. Persist resulting asset URLs through `src/services/apiClient.ts`.
+
+### Add a new pipeline phase
+1. Extend `AdProject['currentPhase']` in `src/types.ts`.
+2. Update phase transitions in `runGenerationPipeline`.
+3. Add phase label in the UI phase tracker.
+4. Add tests for happy path + degraded path.
+5. Document new phase behavior in this README.
+
+### Add new persisted metadata
+1. Update `server/schema.sql`.
+2. Update project/scene route insert + update queries.
+3. Update API client save/load mapping.
+4. Add migration/backfill plan for existing local DBs.
+5. Add test coverage for hydration integrity.
+
+---
+
 ## Troubleshooting
 
 ### Postgres trust-auth issue (Postgres.app)
@@ -470,3 +581,23 @@ Commy is designed to be demo-fast while preserving real integration behavior:
 - real MP4 export path with diagnostics and fallback behavior
 
 If you run `npm run dev` with a valid `.env`, the full local stack should come up and be ready for end-to-end testing.
+
+---
+
+## Contributing
+
+Contributions are welcome, especially around:
+- provider reliability and diagnostics
+- UI/UX polish and accessibility
+- persistence correctness and migrations
+- testing, performance, and export stability
+
+Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a PR.
+
+---
+
+## License
+
+This project is licensed under the MIT License.
+
+See [LICENSE](./LICENSE).
