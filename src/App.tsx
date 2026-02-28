@@ -32,6 +32,56 @@ const formatLogContext = (context?: Record<string, unknown>): string | null => {
     return entries.slice(0, 6).map(([key, value]) => `${key}=${serializeLogContextValue(value)}`).join(' | ');
 };
 
+const GENERATION_CONFIRMATION_PATTERN = /^(yes|yeah|yep|sure|ok|okay|do it|let'?s do it|go ahead|run it|start|create|generate|proceed|lock it in|ship it|go)$/i;
+const GENERATION_VERB_PATTERN = /\b(generate|create|make|produce|render|build|craft)\b/i;
+const GENERATION_TARGET_PATTERN = /\b(video|ad|commercial|campaign|clip|spot|project|film)\b/i;
+const ASSISTANT_READY_PATTERN = /\b(shall we|should we|want me to|ready to generate|go generate|generate (the )?(video|clips|ad)|lock (this )?in|next step)\b/i;
+
+const isMeaningfulUserBrief = (text: string): boolean => {
+    const trimmed = text.trim();
+    if (trimmed.length < 24) return false;
+    return !GENERATION_CONFIRMATION_PATTERN.test(trimmed.toLowerCase());
+};
+
+const getGenerationDecision = (input: string, messages: ChatMessage[]) => {
+    const normalized = input.trim().toLowerCase();
+    const explicitGenerationRequest =
+        GENERATION_VERB_PATTERN.test(normalized) &&
+        (GENERATION_TARGET_PATTERN.test(normalized) || normalized.includes(' now') || normalized.includes('please'));
+    const confirmationOnly = GENERATION_CONFIRMATION_PATTERN.test(normalized);
+    const lastModelMessage = [...messages].reverse().find((m) => m.role === 'model' && !m.isThinking)?.text?.toLowerCase() || '';
+    const assistantPrimedForConfirmation = ASSISTANT_READY_PATTERN.test(lastModelMessage);
+    return {
+        shouldGenerate: explicitGenerationRequest || (confirmationOnly && assistantPrimedForConfirmation),
+        explicitGenerationRequest,
+    };
+};
+
+const buildGenerationPrompt = (input: string, messages: ChatMessage[], project: AdProject | null, isExplicit: boolean): string => {
+    if (isExplicit && input.trim().length > 0) {
+        return input.trim();
+    }
+
+    const priorUserBrief = [...messages]
+        .reverse()
+        .find((m) => m.role === 'user' && isMeaningfulUserBrief(m.text))?.text;
+    const priorDirectorResponse = [...messages]
+        .reverse()
+        .find((m) => m.role === 'model' && !m.isThinking)?.text;
+
+    const contextParts: string[] = ['User confirmed: generate the video now.'];
+    if (priorUserBrief) {
+        contextParts.push(`Original user brief:\n${priorUserBrief}`);
+    }
+    if (priorDirectorResponse) {
+        contextParts.push(`Director guidance:\n${priorDirectorResponse.slice(0, 1400)}`);
+    }
+    if (project) {
+        contextParts.push(`Current project context:\nTitle: ${project.title}\nConcept: ${project.concept}`);
+    }
+    return contextParts.join('\n\n');
+};
+
 // --- Reference Manager (Left Panel) ---
 const ReferenceManager: React.FC<{
     files: ReferenceFile[];
@@ -361,11 +411,13 @@ const ProjectBoard: React.FC<{
     settings: ProjectSettings;
     pipelineLogs: PipelineLogEntry[];
     onCancelGeneration: () => void;
-}> = ({ project, settings, pipelineLogs, onCancelGeneration }) => {
+    onExportLog: (entry: Omit<PipelineLogEntry, 'id' | 'timestamp'>) => void;
+}> = ({ project, settings, pipelineLogs, onCancelGeneration, onExportLog }) => {
     const [activeTab, setActiveTab] = useState<'output' | 'ingredients'>('output');
     const [isPlaying, setIsPlaying] = useState(false);
     const [isExporting, setIsExporting] = useState(false);
     const [exportProgress, setExportProgress] = useState<{ percent: number, message: string } | null>(null);
+    const [downloadTracker, setDownloadTracker] = useState<{ level: 'info' | 'warn' | 'error' | 'success'; message: string } | null>(null);
 
     const [currentTime, setCurrentTime] = useState(0);
     const [activeSceneIndex, setActiveSceneIndex] = useState(0);
@@ -469,27 +521,111 @@ const ProjectBoard: React.FC<{
         }
     }, [isPlaying, project]);
 
+    const triggerDownload = useCallback((url: string, filename: string, revokeAfterMs: number | null = null) => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        if (revokeAfterMs !== null && (url.startsWith('blob:') || url.startsWith('data:'))) {
+            window.setTimeout(() => URL.revokeObjectURL(url), revokeAfterMs);
+        }
+    }, []);
+
+    const attemptFallbackSceneDownload = useCallback(async () => {
+        if (!project) return false;
+        const fallbackScene = project.scenes.find((scene) => Boolean(scene.videoUrl));
+        if (!fallbackScene?.videoUrl) return false;
+
+        const response = await fetch(fallbackScene.videoUrl);
+        if (!response.ok) {
+            throw new Error(`Fallback scene download failed with ${response.status}.`);
+        }
+        const sourceBlob = await response.blob();
+        const blob = sourceBlob.type === 'video/mp4'
+            ? sourceBlob
+            : new Blob([await sourceBlob.arrayBuffer()], { type: 'video/mp4' });
+        const fallbackUrl = URL.createObjectURL(blob);
+        const fallbackName = `${project.title.replace(/\s+/g, '_')}_fallback_clip.mp4`;
+        triggerDownload(fallbackUrl, fallbackName, 30_000);
+        return true;
+    }, [project, triggerDownload]);
+
     const handleExport = async () => {
         if (!project) return;
+        if (!project.scenes.some((scene) => Boolean(scene.videoUrl))) {
+            setDownloadTracker({ level: 'warn', message: 'No generated scene clips yet. Generate at least one clip before MP4 download.' });
+            onExportLog({
+                stage: 'mixing',
+                level: 'warn',
+                message: 'MP4 export skipped: no scene video clips are available.',
+            });
+            alert('MP4 export needs at least one generated video clip. Generate clips first, then download.');
+            return;
+        }
         setIsExporting(true);
         setExportProgress({ percent: 0, message: 'Starting export...' });
+        setDownloadTracker({ level: 'info', message: 'Starting MP4 export...' });
+        onExportLog({
+            stage: 'mixing',
+            level: 'info',
+            message: 'MP4 export started.',
+        });
 
         try {
             const url = await stitchProject(project, settings.aspectRatio, (percent, message) => {
                 setExportProgress({ percent, message });
+                setDownloadTracker({ level: 'info', message: `${message} (${percent}%)` });
             });
 
             if (url) {
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `${project.title.replace(/\s+/g, '_')}_final_mix.mp4`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
+                triggerDownload(url, `${project.title.replace(/\s+/g, '_')}_final_mix.mp4`, 30_000);
+                setDownloadTracker({ level: 'success', message: 'Final MP4 download started.' });
+                onExportLog({
+                    stage: 'ready',
+                    level: 'info',
+                    message: 'Final MP4 download started.',
+                });
             }
         } catch (error) {
             console.error("Export failed:", error);
-            alert("Export failed. See console for details.");
+            onExportLog({
+                stage: 'mixing',
+                level: 'warn',
+                message: `Final mix render failed: ${error instanceof Error ? error.message : String(error)}. Attempting fallback clip download.`,
+            });
+            try {
+                setExportProgress({ percent: 0, message: 'Final mix render failed. Downloading fallback clip...' });
+                setDownloadTracker({ level: 'warn', message: 'Final mix failed. Attempting fallback scene clip download...' });
+                const fallbackDownloaded = await attemptFallbackSceneDownload();
+                if (!fallbackDownloaded) {
+                    setDownloadTracker({ level: 'error', message: 'Export failed. No fallback clip available.' });
+                    onExportLog({
+                        stage: 'mixing',
+                        level: 'error',
+                        message: 'Export failed and no fallback scene clip was available.',
+                    });
+                    alert("Export failed and no fallback scene video is available. See console for details.");
+                } else {
+                    setDownloadTracker({ level: 'warn', message: 'Fallback scene clip download started.' });
+                    onExportLog({
+                        stage: 'mixing',
+                        level: 'warn',
+                        message: 'Fallback scene clip download started.',
+                    });
+                }
+            } catch (fallbackError) {
+                console.error("Fallback scene download failed:", fallbackError);
+                setDownloadTracker({ level: 'error', message: 'Export failed and fallback download failed.' });
+                onExportLog({
+                    stage: 'mixing',
+                    level: 'error',
+                    message: `Fallback download failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+                });
+                alert("Export failed and fallback download also failed. See console for details.");
+            }
         } finally {
             setIsExporting(false);
             setExportProgress(null);
@@ -522,6 +658,10 @@ const ProjectBoard: React.FC<{
     };
 
     const activeScene = project.scenes[activeSceneIndex];
+    const hasExportableVideo = project.scenes.some((scene) => Boolean(scene.videoUrl));
+    const effectiveDownloadTracker = downloadTracker ?? (!hasExportableVideo
+        ? { level: 'warn' as const, message: 'Waiting for generated scene clips before MP4 download can start.' }
+        : null);
     const overlayConfig = activeScene?.overlayConfig;
     const { containerClasses, textClasses } = getOverlayClasses(overlayConfig);
     const canvasW = settings.aspectRatio === AspectRatio.SixteenNine ? 1280 : 720;
@@ -538,7 +678,7 @@ const ProjectBoard: React.FC<{
                 <button onClick={() => setActiveTab('ingredients')} className={`flex-1 py-4 text-sm font-bold uppercase tracking-wider transition-colors ${activeTab === 'ingredients' ? 'text-teal-600 border-b-2 border-teal-500 bg-teal-50/50' : 'text-slate-500 hover:text-slate-700'}`}>Director's View</button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-4 md:p-8 relative">
+            <div className="flex-1 overflow-y-auto p-4 pb-28 md:p-8 md:pb-10 relative">
                 {project.isGenerating && (
                     <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-md flex flex-col items-center justify-center p-8 text-center">
                         <div className="max-w-md w-full space-y-6">
@@ -609,32 +749,53 @@ const ProjectBoard: React.FC<{
                             <div className={containerClasses}><h2 className={textClasses}>{activeScene?.textOverlay}</h2></div>
                         </div>
 
-                        <div className="w-full mt-4 bg-white border border-slate-200 rounded-2xl p-3 md:p-4 shadow-xl flex flex-col md:flex-row items-center gap-4 z-10 max-w-4xl">
-                            <div className="flex items-center gap-4 w-full md:w-auto">
-                                <button onClick={() => setIsPlaying(!isPlaying)} disabled={isExporting} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center bg-slate-900 rounded-full text-white hover:bg-pink-500 transition-all shadow-md shrink-0 disabled:opacity-50">
-                                    {isPlaying ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" className="ml-1" />}
-                                </button>
-                                <div className="flex flex-col">
-                                    <span className="font-mono text-sm font-bold text-slate-700">{formatTime(currentTime)} <span className="text-slate-400">/ {formatTime(totalDuration)}</span></span>
-                                    <span className="text-[10px] font-bold tracking-widest text-slate-400 uppercase">Preview</span>
+                        <div className="w-full mt-4 bg-white border border-slate-200 rounded-2xl p-3 md:p-4 shadow-xl z-10 max-w-4xl">
+                            <div className="flex flex-wrap items-center gap-3 md:gap-4">
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    <button onClick={() => setIsPlaying(!isPlaying)} disabled={isExporting} className="w-10 h-10 md:w-12 md:h-12 flex items-center justify-center bg-slate-900 rounded-full text-white hover:bg-pink-500 transition-all shadow-md shrink-0 disabled:opacity-50">
+                                        {isPlaying ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" className="ml-1" />}
+                                    </button>
+                                    <div className="flex flex-col min-w-0">
+                                        <span className="font-mono text-sm font-bold text-slate-700 whitespace-nowrap">{formatTime(currentTime)} <span className="text-slate-400">/ {formatTime(totalDuration)}</span></span>
+                                        <span className="text-[10px] font-bold tracking-widest text-slate-400 uppercase">Preview</span>
+                                    </div>
                                 </div>
+                                <button
+                                    onClick={handleExport}
+                                    disabled={isExporting || isPlaying || !hasExportableVideo}
+                                    className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl font-bold text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap shrink-0 ml-auto"
+                                    title={!hasExportableVideo ? 'Generate at least one video clip before downloading MP4' : 'Render & Download'}
+                                >
+                                    {isExporting ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
+                                    <span>{isExporting ? 'Rendering...' : 'Download'}</span>
+                                </button>
+                                <div className="basis-full md:basis-auto md:flex-1 h-2 bg-slate-100 rounded-full overflow-hidden relative group cursor-pointer">
+                                    <div className="absolute top-0 left-0 h-full bg-slate-200 w-full" />
+                                    <div className="absolute top-0 left-0 h-full bg-gradient-to-r from-pink-500 to-orange-400 transition-all duration-100 ease-linear" style={{ width: `${totalDuration > 0 ? (currentTime / totalDuration) * 100 : 0}%` }} />
+                                </div>
+                                {effectiveDownloadTracker && (
+                                    <div
+                                        className={`basis-full rounded-lg border px-3 py-2 text-[11px] font-medium ${effectiveDownloadTracker.level === 'error'
+                                            ? 'border-red-200 bg-red-50 text-red-700'
+                                            : effectiveDownloadTracker.level === 'warn'
+                                                ? 'border-amber-200 bg-amber-50 text-amber-700'
+                                                : effectiveDownloadTracker.level === 'success'
+                                                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                    : 'border-slate-200 bg-slate-50 text-slate-700'
+                                            }`}
+                                    >
+                                        <span className="font-bold">Download Tracker:</span> {effectiveDownloadTracker.message}
+                                    </div>
+                                )}
                             </div>
-                            <div className="flex-1 w-full h-2 bg-slate-100 rounded-full overflow-hidden relative group cursor-pointer">
-                                <div className="absolute top-0 left-0 h-full bg-slate-200 w-full" />
-                                <div className="absolute top-0 left-0 h-full bg-gradient-to-r from-pink-500 to-orange-400 transition-all duration-100 ease-linear" style={{ width: `${totalDuration > 0 ? (currentTime / totalDuration) * 100 : 0}%` }} />
-                            </div>
-                            <button onClick={handleExport} disabled={isExporting || isPlaying} className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl font-bold text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap" title="Render & Download">
-                                {isExporting ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
-                                <span>{isExporting ? 'Rendering...' : 'Download'}</span>
-                            </button>
                         </div>
 
-                        <div className="mt-6 w-full max-w-2xl text-center">
-                            <div className="flex items-center justify-center gap-2 mb-2">
-                                <h1 className="text-2xl md:text-3xl font-display font-bold text-slate-800">{project.title}</h1>
-                                {project.mode && <span className="text-[10px] bg-purple-100 text-purple-600 px-2 py-1 rounded-full uppercase font-bold tracking-wider">{project.mode}</span>}
+                        <div className="mt-6 w-full max-w-2xl text-center px-1">
+                            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-center gap-2 mb-3">
+                                <h1 className="text-2xl md:text-3xl font-display font-bold text-slate-800 break-words">{project.title}</h1>
+                                {project.mode && <span className="text-[10px] bg-purple-100 text-purple-600 px-2 py-1 rounded-full uppercase font-bold tracking-wider self-center">{project.mode}</span>}
                             </div>
-                            <p className="text-sm text-slate-600 max-w-lg mx-auto">{project.concept}</p>
+                            <p className="text-sm text-slate-600 max-w-lg mx-auto leading-relaxed break-words">{project.concept}</p>
                         </div>
                     </div>
                 ) : (
@@ -715,46 +876,46 @@ const ProjectBoard: React.FC<{
                                         {/* INGREDIENTS */}
                                         <div className="md:col-span-8 lg:col-span-9 grid grid-cols-1 md:grid-cols-2 gap-3">
                                             {/* Camera Card */}
-                                            <div className="bg-blue-50 border border-blue-100 p-3 rounded-xl">
-                                                <div className="flex items-center gap-2 text-blue-700 font-bold text-xs uppercase tracking-wider mb-2">
+                                            <div className="director-ingredient-card director-ingredient-camera p-3 rounded-xl">
+                                                <div className="director-ingredient-heading flex items-center gap-2 font-bold text-xs uppercase tracking-wider mb-2">
                                                     <Camera size={14} /> Camera
                                                 </div>
                                                 <div className="space-y-1">
-                                                    <p className="text-xs text-slate-700"><span className="font-bold">Framing:</span> {scene.camera.framing}</p>
-                                                    <p className="text-xs text-slate-700"><span className="font-bold">Move:</span> {scene.camera.movement}</p>
+                                                    <p className="director-ingredient-text text-xs"><span className="font-bold">Framing:</span> {scene.camera.framing}</p>
+                                                    <p className="director-ingredient-text text-xs"><span className="font-bold">Move:</span> {scene.camera.movement}</p>
                                                 </div>
                                             </div>
 
                                             {/* Lighting Card */}
-                                            <div className="bg-amber-50 border border-amber-100 p-3 rounded-xl">
-                                                <div className="flex items-center gap-2 text-amber-700 font-bold text-xs uppercase tracking-wider mb-2">
+                                            <div className="director-ingredient-card director-ingredient-lighting p-3 rounded-xl">
+                                                <div className="director-ingredient-heading flex items-center gap-2 font-bold text-xs uppercase tracking-wider mb-2">
                                                     <Sun size={14} /> Lighting & Env
                                                 </div>
                                                 <div className="space-y-1">
-                                                    <p className="text-xs text-slate-700"><span className="font-bold">Light:</span> {scene.environment.lighting}</p>
-                                                    <p className="text-xs text-slate-700"><span className="font-bold">Loc:</span> {scene.environment.location}</p>
+                                                    <p className="director-ingredient-text text-xs"><span className="font-bold">Light:</span> {scene.environment.lighting}</p>
+                                                    <p className="director-ingredient-text text-xs"><span className="font-bold">Loc:</span> {scene.environment.location}</p>
                                                 </div>
                                             </div>
 
                                             {/* Wardrobe Card */}
-                                            <div className="bg-purple-50 border border-purple-100 p-3 rounded-xl">
-                                                <div className="flex items-center gap-2 text-purple-700 font-bold text-xs uppercase tracking-wider mb-2">
+                                            <div className="director-ingredient-card director-ingredient-character p-3 rounded-xl">
+                                                <div className="director-ingredient-heading flex items-center gap-2 font-bold text-xs uppercase tracking-wider mb-2">
                                                     <Shirt size={14} /> Character
                                                 </div>
                                                 <div className="space-y-1">
-                                                    <p className="text-xs text-slate-700 line-clamp-2">{scene.character.description}</p>
-                                                    <p className="text-[10px] text-purple-600 font-mono mt-1 bg-purple-100/50 p-1 rounded">
+                                                    <p className="director-ingredient-text text-xs line-clamp-2">{scene.character.description}</p>
+                                                    <p className="director-ingredient-note text-[10px] font-mono mt-1 p-1 rounded">
                                                         Wearing: {scene.character.wardrobe}
                                                     </p>
                                                 </div>
                                             </div>
 
                                             {/* Action Card */}
-                                            <div className="bg-slate-50 border border-slate-100 p-3 rounded-xl">
-                                                <div className="flex items-center gap-2 text-slate-700 font-bold text-xs uppercase tracking-wider mb-2">
+                                            <div className="director-ingredient-card director-ingredient-action p-3 rounded-xl">
+                                                <div className="director-ingredient-heading flex items-center gap-2 font-bold text-xs uppercase tracking-wider mb-2">
                                                     <Video size={14} /> Action Blocking
                                                 </div>
-                                                <ul className="text-xs text-slate-600 list-disc list-inside space-y-1">
+                                                <ul className="director-ingredient-list text-xs list-disc list-inside space-y-1">
                                                     {scene.action_blocking.map((action, i) => (
                                                         <li key={i}>{action.notes}</li>
                                                     ))}
@@ -818,15 +979,17 @@ const AgentChat: React.FC<{
         setInput('');
         setAttachments([]);
 
-        // Check if we should generate a project
-        const isGenerationRequest = input.toLowerCase().includes('generate') || input.toLowerCase().includes('create') || input.toLowerCase().includes('make a video');
+        // Trigger generation either from explicit "create/generate video" intent
+        // or short confirmations ("create", "do it") after the assistant asks to proceed.
+        const generationDecision = getGenerationDecision(input, messages);
 
-        if (isGenerationRequest && !project) {
+        if (generationDecision.shouldGenerate) {
             // Trigger generation
             const thinkingMsg: ChatMessage = { id: 'thinking', role: 'model', text: 'Developing creative concept...', timestamp: Date.now(), isThinking: true };
             setMessages(prev => [...prev, thinkingMsg]);
 
-            const outcome = await onGenerate(input, userMsg.attachments);
+            const generationPrompt = buildGenerationPrompt(input, messages, project, generationDecision.explicitGenerationRequest);
+            const outcome = await onGenerate(generationPrompt, userMsg.attachments);
             let followup = "I've drafted a creative brief and storyboard based on your request. Check out the project board!";
             if (outcome.cancelled) {
                 followup = "Production was cancelled. You can adjust your prompt and try again.";
@@ -908,10 +1071,10 @@ const AgentChat: React.FC<{
 
     return (
         <div className={`
-        fixed bottom-0 right-0 w-full lg:w-96 lg:right-6 lg:bottom-6 
+        fixed bottom-0 left-0 right-0 w-auto lg:w-96 lg:left-auto lg:right-6 lg:bottom-6 
         bg-white rounded-t-2xl lg:rounded-2xl shadow-2xl border border-slate-200 z-[100] 
         flex flex-col overflow-hidden transition-all duration-300 ease-in-out
-        ${isOpen ? 'h-[60vh] lg:h-[600px]' : 'h-14'}
+        ${isOpen ? 'h-[62dvh] max-h-[calc(100dvh-4rem)] lg:h-[600px] lg:max-h-[600px]' : 'h-14'}
     `}>
             {/* Header */}
             <div
@@ -964,7 +1127,7 @@ const AgentChat: React.FC<{
             </div>
 
             {/* Input Area */}
-            <div className="p-3 bg-white border-t border-slate-200">
+            <div className="p-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] bg-white border-t border-slate-200">
                 {showLinkInput && (
                     <div className="flex gap-2 mb-2 animate-in slide-in-from-bottom-2">
                         <input
@@ -1345,7 +1508,7 @@ export const App: React.FC = () => {
     }
 
     return (
-        <div className="h-screen w-screen flex flex-col overflow-hidden bg-slate-50">
+        <div className="h-dvh min-h-dvh w-screen flex flex-col overflow-hidden bg-slate-50">
             <header className="h-16 flex items-center justify-between px-4 md:px-6 bg-white/40 backdrop-blur-md border-b border-white/50 z-20 relative shrink-0">
                 {/* Mobile: Left Button opens Assets */}
                 <button onClick={() => setShowLeftPanel(!showLeftPanel)} className="lg:hidden p-2 text-slate-700 hover:bg-white/50 rounded-lg transition-colors">
@@ -1410,6 +1573,7 @@ export const App: React.FC = () => {
                             settings={settings}
                             pipelineLogs={pipelineLogs}
                             onCancelGeneration={handleCancelGeneration}
+                            onExportLog={pushManualPipelineLog}
                         />
                     </div>
 

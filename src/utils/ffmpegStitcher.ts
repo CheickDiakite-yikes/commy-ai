@@ -3,6 +3,51 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import { AdProject, AspectRatio, Scene } from '../types';
 import { drawTextOverlayToCanvas } from './canvasUtils';
 
+const FFMPEG_CORE_BASE_URLS = [
+    'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd',
+    'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd',
+];
+
+const FFMPEG_LOAD_TIMEOUT_MS = 30_000;
+const FFMPEG_EXEC_TIMEOUT_MS = 6 * 60_000;
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+    return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s.`)), timeoutMs),
+        ),
+    ]);
+};
+
+const loadFfmpegCore = async (
+    ffmpeg: FFmpeg,
+    onProgress: (progress: number, message: string) => void,
+) => {
+    let lastError: unknown;
+    for (const baseURL of FFMPEG_CORE_BASE_URLS) {
+        try {
+            const host = new URL(baseURL).host;
+            onProgress(0, `Loading rendering engine (${host})...`);
+            await withTimeout(
+                ffmpeg.load({
+                    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+                    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+                }),
+                FFMPEG_LOAD_TIMEOUT_MS,
+                `FFmpeg core load from ${host}`,
+            );
+            return;
+        } catch (error) {
+            lastError = error;
+            console.warn('[FFmpeg] Failed to load core from CDN', { baseURL, error });
+        }
+    }
+
+    const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(`Unable to load FFmpeg rendering engine. ${errorMessage}`);
+};
+
 const createOverlayPng = async (scene: Scene, width: number, height: number): Promise<Uint8Array> => {
     const canvas = document.createElement('canvas');
     canvas.width = width;
@@ -44,13 +89,7 @@ export const stitchProject = async (
         console.log('[FFmpeg]', message);
     });
 
-    onProgress(0, 'Loading rendering engine...');
-    
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-    await ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-    });
+    await loadFfmpegCore(ffmpeg, onProgress);
 
     const width = aspectRatio === AspectRatio.SixteenNine ? 1280 : 720;
     const height = aspectRatio === AspectRatio.SixteenNine ? 720 : 1280;
@@ -65,22 +104,30 @@ export const stitchProject = async (
     for (let i = 0; i < project.scenes.length; i++) {
         const scene = project.scenes[i];
         if (!scene.videoUrl) continue;
+        try {
+            const vidName = `vid${i}.mp4`;
+            const overlayName = `overlay${i}.png`;
 
-        const vidName = `vid${i}.mp4`;
-        const overlayName = `overlay${i}.png`;
+            await ffmpeg.writeFile(vidName, await fetchFile(scene.videoUrl));
+            inputs.push(`-i`, vidName);
+            const vidInputIdx = (inputs.length / 2) - 1;
 
-        await ffmpeg.writeFile(vidName, await fetchFile(scene.videoUrl));
-        inputs.push(`-i`, vidName);
-        const vidInputIdx = (inputs.length / 2) - 1;
+            const overlayData = await createOverlayPng(scene, width, height);
+            await ffmpeg.writeFile(overlayName, overlayData);
+            inputs.push(`-i`, overlayName);
+            const overlayInputIdx = (inputs.length / 2) - 1;
 
-        const overlayData = await createOverlayPng(scene, width, height);
-        await ffmpeg.writeFile(overlayName, overlayData);
-        inputs.push(`-i`, overlayName);
-        const overlayInputIdx = (inputs.length / 2) - 1;
-
-        filterComplex += `[${vidInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}[vscaled${i}];`;
-        filterComplex += `[vscaled${i}][${overlayInputIdx}:v]overlay=0:0[vout${i}];`;
-        videoOutLabels.push(`[vout${i}]`);
+            filterComplex += `[${vidInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}[vscaled${i}];`;
+            filterComplex += `[vscaled${i}][${overlayInputIdx}:v]overlay=0:0[vout${i}];`;
+            videoOutLabels.push(`[vout${i}]`);
+        } catch (error) {
+            console.warn('[FFmpeg] Scene skipped during export due to input error.', {
+                sceneId: scene.id,
+                sceneOrder: scene.order,
+                videoUrl: scene.videoUrl,
+                error,
+            });
+        }
     }
 
     if (videoOutLabels.length === 0) {
@@ -136,7 +183,7 @@ export const stitchProject = async (
         'output.mp4'
     );
 
-    await ffmpeg.exec(args);
+    await withTimeout(ffmpeg.exec(args), FFMPEG_EXEC_TIMEOUT_MS, 'FFmpeg final render');
 
     onProgress(95, 'Finalizing file...');
     const data = await ffmpeg.readFile('output.mp4');
