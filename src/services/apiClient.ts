@@ -6,10 +6,18 @@
  * continues to work using localStorage and blob URLs — zero breaking changes.
  */
 
-const API_BASE = 'http://localhost:3001/api';
-const STORAGE_BASE = 'http://localhost:3001/storage';
+const API_BASE = '/api';
+const STORAGE_BASE = '/storage';
 
 let _backendAvailable: boolean | null = null;
+
+const toAbsoluteUrl = (pathOrUrl: string): string => {
+    if (/^https?:\/\//.test(pathOrUrl) || pathOrUrl.startsWith('blob:') || pathOrUrl.startsWith('data:')) {
+        return pathOrUrl;
+    }
+    const path = pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`;
+    return `${window.location.origin}${path}`;
+};
 
 const logApiErrorResponse = async (label: string, response: Response) => {
     let bodyPreview = '';
@@ -54,7 +62,9 @@ export const isBackendAvailable = () => _backendAvailable === true;
  * Convert a backend relative path to a full URL 
  */
 export const toStorageUrl = (relativePath: string): string => {
-    return `${STORAGE_BASE}/${relativePath}`;
+    if (!relativePath) return toAbsoluteUrl(STORAGE_BASE);
+    if (relativePath.startsWith('/storage/')) return toAbsoluteUrl(relativePath);
+    return toAbsoluteUrl(`${STORAGE_BASE}/${relativePath.replace(/^\/+/, '')}`);
 };
 
 // ─── Project API ───────────────────────────────────────────────
@@ -146,7 +156,7 @@ export const uploadSceneMedia = async (
         }
 
         const result = await res.json();
-        return result[`${type}_url`] ? `${STORAGE_BASE.replace('/storage', '')}${result[`${type}_url`]}` : null;
+        return result[`${type}_url`] ? toAbsoluteUrl(result[`${type}_url`]) : null;
     } catch (err) {
         console.error(`Failed to upload ${type} for scene ${sceneId}:`, err);
         return null;
@@ -196,7 +206,7 @@ export const uploadProjectAsset = async (
         }
 
         const result = await res.json();
-        return result.file_url ? `${STORAGE_BASE.replace('/storage', '')}${result.file_url}` : null;
+        return result.file_url ? toAbsoluteUrl(result.file_url) : null;
     } catch (err) {
         console.error(`Failed to upload ${assetType} asset:`, err);
         return null;

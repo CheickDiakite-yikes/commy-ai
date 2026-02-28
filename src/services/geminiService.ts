@@ -1,6 +1,28 @@
 import { GoogleGenAI, Type, Schema, Modality } from "@google/genai";
 import { AspectRatio, ProjectSettings, ReferenceFile, TTSVoice, AdProject, DialogueLine, ChatAttachment, Scene } from "../types";
 
+export type ProviderName = 'gemini' | 'veo' | 'lyria';
+export type ProviderOperation = 'storyboard' | 'video' | 'voiceover' | 'music';
+export type ProviderDiagnosticLevel = 'info' | 'warn' | 'error';
+
+export interface ProviderDiagnostic {
+    level: ProviderDiagnosticLevel;
+    code: string;
+    message: string;
+    context?: Record<string, unknown>;
+    error?: unknown;
+}
+
+export interface GeneratedAssetResult {
+    provider: ProviderName;
+    operation: ProviderOperation;
+    url: string | null;
+    fallbackUsed?: boolean;
+    diagnostics?: ProviderDiagnostic[];
+}
+
+export type AssetGenerationResponse = GeneratedAssetResult | string | null;
+
 // --- AUDIO UTILITIES (PCM to WAV) ---
 
 const writeString = (view: DataView, offset: number, string: string) => {
@@ -74,6 +96,28 @@ const parseDataUrl = (dataUrl: string) => {
 
 const toErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 const hasApiKey = () => Boolean(process.env.API_KEY);
+
+const diagnostic = (
+    level: ProviderDiagnosticLevel,
+    code: string,
+    message: string,
+    context?: Record<string, unknown>,
+    error?: unknown,
+): ProviderDiagnostic => ({ level, code, message, context, error });
+
+const buildGeneratedAssetResult = (
+    provider: ProviderName,
+    operation: ProviderOperation,
+    url: string | null,
+    diagnostics: ProviderDiagnostic[],
+    fallbackUsed: boolean = false,
+): GeneratedAssetResult => ({
+    provider,
+    operation,
+    url,
+    fallbackUsed,
+    diagnostics,
+});
 
 const parsePcmMimeType = (mimeType?: string) => {
     if (!mimeType) return null;
@@ -283,10 +327,19 @@ export const generateStoryboardImage = async (
     scene: Scene,
     aspectRatio: AspectRatio,
     visualAnchorDataUrl?: string,
-): Promise<string | null> => {
+): Promise<AssetGenerationResponse> => {
+    const diagnostics: ProviderDiagnostic[] = [];
     if (!hasApiKey()) {
         console.error("[Gemini][Storyboard] Missing API key.");
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'error',
+                'GEMINI_STORYBOARD_MISSING_API_KEY',
+                'Missing Gemini API key. Set GEMINI_API_KEY before generating storyboards.',
+                { sceneId: scene.id },
+            ),
+        );
+        return buildGeneratedAssetResult('gemini', 'storyboard', null, diagnostics);
     }
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const aspect = aspectRatio === AspectRatio.SixteenNine ? '16:9' : '9:16';
@@ -301,6 +354,15 @@ export const generateStoryboardImage = async (
                 inlineData: { mimeType: parsed.mimeType, data: parsed.base64 }
             });
             parts.push({ text: "REFERENCE IMAGE: Use the subject from this image. Keep their face and body consistent." });
+        } else {
+            diagnostics.push(
+                diagnostic(
+                    'warn',
+                    'GEMINI_STORYBOARD_ANCHOR_PARSE_FAILED',
+                    'Visual anchor could not be parsed. Continuing without reference image.',
+                    { sceneId: scene.id },
+                ),
+            );
         }
     }
 
@@ -349,21 +411,48 @@ export const generateStoryboardImage = async (
                     sceneId: scene.id,
                     mimeType: part.inlineData.mimeType,
                 });
-                return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+                return buildGeneratedAssetResult(
+                    'gemini',
+                    'storyboard',
+                    `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
+                    diagnostics,
+                );
             }
         }
         console.warn("[Gemini][Storyboard] No image returned for scene", { sceneId: scene.id });
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'warn',
+                'GEMINI_STORYBOARD_EMPTY_RESPONSE',
+                'Gemini returned no storyboard image for this scene.',
+                { sceneId: scene.id, model: 'gemini-3-pro-image-preview' },
+            ),
+        );
+        return buildGeneratedAssetResult('gemini', 'storyboard', null, diagnostics);
     } catch (e) {
         console.error("[Gemini][Storyboard] Storyboard generation failed", {
             sceneId: scene.id,
             error: toErrorMessage(e),
         }, e);
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'error',
+                'GEMINI_STORYBOARD_REQUEST_FAILED',
+                'Storyboard generation request failed.',
+                { sceneId: scene.id, model: 'gemini-3-pro-image-preview' },
+                e,
+            ),
+        );
+        return buildGeneratedAssetResult('gemini', 'storyboard', null, diagnostics);
     }
 };
 
 // --- 3. Veo 3.1 Video Generation ---
+
+interface VideoAttemptResult {
+    url: string | null;
+    diagnostics: ProviderDiagnostic[];
+}
 
 const internalGenerateVideo = async (
     ai: GoogleGenAI,
@@ -371,7 +460,8 @@ const internalGenerateVideo = async (
     aspect: string,
     attemptLabel: string,
     imageInput?: { base64: string, mimeType: string }
-): Promise<string | null> => {
+): Promise<VideoAttemptResult> => {
+    const diagnostics: ProviderDiagnostic[] = [];
     try {
         console.log("[Veo] Starting video generation attempt", {
             attemptLabel,
@@ -395,7 +485,15 @@ const internalGenerateVideo = async (
             polls += 1;
             if (polls > 90) {
                 console.warn("[Veo] Video generation timed out while polling.", { attemptLabel, polls });
-                return null;
+                diagnostics.push(
+                    diagnostic(
+                        'warn',
+                        'VEO_POLL_TIMEOUT',
+                        'Video generation timed out while polling the Veo operation.',
+                        { attemptLabel, polls },
+                    ),
+                );
+                return { url: null, diagnostics };
             }
             await new Promise(resolve => setTimeout(resolve, 5000));
             operation = await ai.operations.getVideosOperation({ operation: operation });
@@ -404,7 +502,15 @@ const internalGenerateVideo = async (
         const videoUri = operation.response?.generatedVideos?.[0]?.video?.uri;
         if (!videoUri) {
             console.warn("[Veo] Generation completed without a video URI.", { attemptLabel });
-            return null;
+            diagnostics.push(
+                diagnostic(
+                    'warn',
+                    'VEO_EMPTY_VIDEO_URI',
+                    'Veo operation completed without returning a downloadable video URL.',
+                    { attemptLabel },
+                ),
+            );
+            return { url: null, diagnostics };
         }
 
         const response = await fetch(`${videoUri}&key=${process.env.API_KEY}`);
@@ -414,20 +520,41 @@ const internalGenerateVideo = async (
                 status: response.status,
                 statusText: response.statusText,
             });
-            return null;
+            diagnostics.push(
+                diagnostic(
+                    'error',
+                    'VEO_DOWNLOAD_FAILED',
+                    'Veo generated a video URI, but downloading the asset failed.',
+                    {
+                        attemptLabel,
+                        status: response.status,
+                        statusText: response.statusText,
+                    },
+                ),
+            );
+            return { url: null, diagnostics };
         }
         const blob = await response.blob();
         console.log("[Veo] Video generation attempt succeeded.", {
             attemptLabel,
             sizeBytes: blob.size,
         });
-        return URL.createObjectURL(blob);
+        return { url: URL.createObjectURL(blob), diagnostics };
     } catch (error) {
         console.error("[Veo] Video generation attempt failed.", {
             attemptLabel,
             error: toErrorMessage(error),
         }, error);
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'error',
+                'VEO_REQUEST_FAILED',
+                'Video generation attempt failed.',
+                { attemptLabel },
+                error,
+            ),
+        );
+        return { url: null, diagnostics };
     }
 }
 
@@ -435,14 +562,24 @@ export const generateVideoClip = async (
     scene: Scene,
     aspectRatio: AspectRatio,
     sourceImageDataUrl?: string
-): Promise<string | null> => {
+): Promise<AssetGenerationResponse> => {
+    const diagnostics: ProviderDiagnostic[] = [];
     if (!hasApiKey()) {
         console.error("[Veo] Missing API key.");
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'error',
+                'VEO_MISSING_API_KEY',
+                'Missing Gemini API key. Set GEMINI_API_KEY before generating video.',
+                { sceneId: scene.id },
+            ),
+        );
+        return buildGeneratedAssetResult('veo', 'video', null, diagnostics);
     }
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const aspect = aspectRatio === AspectRatio.SixteenNine ? '16:9' : '9:16';
     const actionNotes = Array.isArray(scene.action_blocking) ? scene.action_blocking.map(a => a.notes).join('. ') : '';
+    let usedFallbackMode = false;
 
     // Construct a rich prompt for Veo as well, even if using image input
     const veoPrompt = `
@@ -456,33 +593,73 @@ export const generateVideoClip = async (
     if (sourceImageDataUrl) {
         const parsed = parseDataUrl(sourceImageDataUrl);
         if (parsed) {
-            const videoUrl = await internalGenerateVideo(ai, veoPrompt, aspect, `scene-${scene.id}-image2video`, parsed);
-            if (videoUrl) return videoUrl;
+            const attempt = await internalGenerateVideo(ai, veoPrompt, aspect, `scene-${scene.id}-image2video`, parsed);
+            diagnostics.push(...attempt.diagnostics);
+            if (attempt.url) {
+                return buildGeneratedAssetResult('veo', 'video', attempt.url, diagnostics, usedFallbackMode);
+            }
             console.warn("[Veo] Image-to-video attempt failed, falling back to text-to-video.", { sceneId: scene.id });
+            diagnostics.push(
+                diagnostic(
+                    'warn',
+                    'VEO_IMAGE_TO_VIDEO_FAILED',
+                    'Image-to-video attempt failed. Falling back to text-to-video.',
+                    { sceneId: scene.id },
+                ),
+            );
+            usedFallbackMode = true;
         } else {
             console.warn("[Veo] Storyboard image could not be parsed. Falling back to text-to-video.", { sceneId: scene.id });
+            diagnostics.push(
+                diagnostic(
+                    'warn',
+                    'VEO_SOURCE_IMAGE_PARSE_FAILED',
+                    'Storyboard image could not be parsed. Falling back to text-to-video.',
+                    { sceneId: scene.id },
+                ),
+            );
+            usedFallbackMode = true;
         }
     }
 
     // ATTEMPT 2: Text-to-Video (Fallback using the visual summary)
-    return await internalGenerateVideo(
+    const textAttempt = await internalGenerateVideo(
         ai,
         `${scene.visual_summary_prompt || veoPrompt} (Cinematic, Photorealistic)`,
         aspect,
         `scene-${scene.id}-text2video`,
         undefined
     );
+    diagnostics.push(...textAttempt.diagnostics);
+    return buildGeneratedAssetResult('veo', 'video', textAttempt.url, diagnostics, usedFallbackMode);
 };
 
 // --- 4. TTS Generation (PCM to WAV) ---
 
-export const generateVoiceover = async (text: string, voice: TTSVoice, dialogue?: DialogueLine[]): Promise<string | null> => {
+export const generateVoiceover = async (text: string, voice: TTSVoice, dialogue?: DialogueLine[]): Promise<AssetGenerationResponse> => {
+    const diagnostics: ProviderDiagnostic[] = [];
     if (!hasApiKey()) {
         console.error("[Gemini][TTS] Missing API key.");
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'error',
+                'GEMINI_TTS_MISSING_API_KEY',
+                'Missing Gemini API key. Set GEMINI_API_KEY before generating voiceover.',
+            ),
+        );
+        return buildGeneratedAssetResult('gemini', 'voiceover', null, diagnostics);
     }
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    if (!text && (!dialogue || dialogue.length === 0)) return null;
+    if (!text && (!dialogue || dialogue.length === 0)) {
+        diagnostics.push(
+            diagnostic(
+                'warn',
+                'GEMINI_TTS_EMPTY_INPUT',
+                'No script content provided for voiceover generation.',
+            ),
+        );
+        return buildGeneratedAssetResult('gemini', 'voiceover', null, diagnostics);
+    }
 
     try {
         let config: any = { responseModalities: [Modality.AUDIO] };
@@ -533,7 +710,7 @@ export const generateVoiceover = async (text: string, voice: TTSVoice, dialogue?
                     channels: pcmConfig.channels,
                     sizeBytes: wavBlob.size,
                 });
-                return URL.createObjectURL(wavBlob);
+                return buildGeneratedAssetResult('gemini', 'voiceover', URL.createObjectURL(wavBlob), diagnostics);
             }
 
             const audioBlob = new Blob([rawAudio], { type: inlineAudio?.mimeType || 'audio/wav' });
@@ -541,15 +718,31 @@ export const generateVoiceover = async (text: string, voice: TTSVoice, dialogue?
                 mimeType: inlineAudio?.mimeType,
                 sizeBytes: audioBlob.size,
             });
-            return URL.createObjectURL(audioBlob);
+            return buildGeneratedAssetResult('gemini', 'voiceover', URL.createObjectURL(audioBlob), diagnostics);
         }
         console.warn("[Gemini][TTS] No inline audio payload returned.");
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'warn',
+                'GEMINI_TTS_EMPTY_AUDIO',
+                'Gemini TTS responded without inline audio data.',
+            ),
+        );
+        return buildGeneratedAssetResult('gemini', 'voiceover', null, diagnostics);
     } catch (error) {
         console.error("[Gemini][TTS] Voiceover generation failed.", {
             error: toErrorMessage(error),
         }, error);
-        return null;
+        diagnostics.push(
+            diagnostic(
+                'error',
+                'GEMINI_TTS_REQUEST_FAILED',
+                'Voiceover generation request failed.',
+                undefined,
+                error,
+            ),
+        );
+        return buildGeneratedAssetResult('gemini', 'voiceover', null, diagnostics);
     }
 };
 
@@ -571,24 +764,40 @@ const getFallbackMusic = (mood: string) => {
     return MOOD_TRACKS['cinematic'];
 }
 
-export const generateMusic = async (moodDescription: string, durationSeconds: number = 30): Promise<string | null> => {
-    const triggerFallback = (reason: string) => {
+export const generateMusic = async (moodDescription: string, durationSeconds: number = 30): Promise<AssetGenerationResponse> => {
+    const diagnostics: ProviderDiagnostic[] = [];
+    const triggerFallback = (
+        reason: string,
+        code: string,
+        level: ProviderDiagnosticLevel = 'warn',
+        error?: unknown,
+    ): GeneratedAssetResult => {
         console.warn(`[Lyria] Falling back to stock music. Reason: ${reason}`);
-        return getFallbackMusic(moodDescription);
+        diagnostics.push(
+            diagnostic(
+                level,
+                code,
+                `Falling back to stock music: ${reason}.`,
+                { durationSeconds, moodPreview: moodDescription.slice(0, 120) },
+                error,
+            ),
+        );
+        return buildGeneratedAssetResult('lyria', 'music', getFallbackMusic(moodDescription), diagnostics, true);
     };
 
     if (!hasApiKey()) {
-        return triggerFallback("Missing API key");
+        return triggerFallback("Missing API key", "LYRIA_MISSING_API_KEY", "error");
     }
 
     return new Promise((resolve) => {
         let hasResolved = false;
         let chunkCount = 0;
         let receivedBytes = 0;
+        let stopTimer: ReturnType<typeof setTimeout> | undefined;
         const safetyTimeout = setTimeout(() => {
             if (!hasResolved) {
                 hasResolved = true;
-                resolve(triggerFallback("Lyria Timeout"));
+                resolve(triggerFallback("Lyria timeout", "LYRIA_TIMEOUT", "error"));
             }
         }, (durationSeconds * 1000) + 15000);
 
@@ -601,6 +810,14 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                 durationSeconds,
                 moodPreview: moodDescription.slice(0, 100),
             });
+            diagnostics.push(
+                diagnostic(
+                    'info',
+                    'LYRIA_SOCKET_OPENING',
+                    'Opening Lyria realtime music socket.',
+                    { durationSeconds, moodPreview: moodDescription.slice(0, 100) },
+                ),
+            );
 
             ws.onopen = () => {
                 // 1. Send Setup
@@ -608,6 +825,13 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                     setup: { model: 'models/lyria-realtime-exp' }
                 }));
                 console.log("[Lyria] Socket open, setup sent.");
+                diagnostics.push(
+                    diagnostic(
+                        'info',
+                        'LYRIA_SOCKET_OPEN',
+                        'Lyria socket opened successfully.',
+                    ),
+                );
             };
 
             ws.onmessage = async (event) => {
@@ -623,6 +847,15 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                     console.warn("[Lyria] Failed to parse websocket message.", {
                         error: toErrorMessage(parseErr),
                     });
+                    diagnostics.push(
+                        diagnostic(
+                            'warn',
+                            'LYRIA_MESSAGE_PARSE_FAILED',
+                            'Failed to parse Lyria websocket message.',
+                            undefined,
+                            parseErr,
+                        ),
+                    );
                     return;
                 }
 
@@ -646,6 +879,13 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                         playbackControl: 'PLAY'
                     }));
                     console.log("[Lyria] Setup complete, config/prompts/play sent.");
+                    diagnostics.push(
+                        diagnostic(
+                            'info',
+                            'LYRIA_PLAYBACK_STARTED',
+                            'Lyria setup complete and playback started.',
+                        ),
+                    );
                 } else if (msg.serverContent && msg.serverContent.audioChunks) {
                     for (const chunk of msg.serverContent.audioChunks) {
                         try {
@@ -657,10 +897,27 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                             console.warn("[Lyria] Failed to decode audio chunk.", {
                                 error: toErrorMessage(chunkErr),
                             });
+                            diagnostics.push(
+                                diagnostic(
+                                    'warn',
+                                    'LYRIA_CHUNK_DECODE_FAILED',
+                                    'Failed to decode a Lyria audio chunk.',
+                                    undefined,
+                                    chunkErr,
+                                ),
+                            );
                         }
                     }
                 } else if (msg.warning) {
                     console.warn("[Lyria] Warning:", msg.warning);
+                    diagnostics.push(
+                        diagnostic(
+                            'warn',
+                            'LYRIA_SERVER_WARNING',
+                            'Lyria server returned a warning.',
+                            { warning: msg.warning },
+                        ),
+                    );
                 }
             };
 
@@ -669,7 +926,8 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                 if (!hasResolved) {
                     hasResolved = true;
                     clearTimeout(safetyTimeout);
-                    resolve(triggerFallback("WebSocket Error"));
+                    if (stopTimer) clearTimeout(stopTimer);
+                    resolve(triggerFallback("WebSocket error", "LYRIA_SOCKET_ERROR", "error", err));
                 }
             };
 
@@ -677,6 +935,7 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                 if (!hasResolved) {
                     hasResolved = true;
                     clearTimeout(safetyTimeout);
+                    if (stopTimer) clearTimeout(stopTimer);
                     console.log("[Lyria] Socket closed.", {
                         code: event.code,
                         reason: event.reason,
@@ -685,7 +944,7 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                         receivedBytes,
                     });
                     if (chunks.length === 0) {
-                        resolve(triggerFallback("No Data Received"));
+                        resolve(triggerFallback("No data received from Lyria", "LYRIA_NO_DATA"));
                         return;
                     }
 
@@ -700,12 +959,20 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
                     // Lyria typically outputs 44.1kHz or 48kHz PCM. Assuming 48kHz stereo.
                     const wavBlob = pcmToWavBlob(combinedPcm, 48000, 2);
                     console.log("[Lyria] Music generated.", { sizeBytes: wavBlob.size, chunkCount });
-                    resolve(URL.createObjectURL(wavBlob));
+                    diagnostics.push(
+                        diagnostic(
+                            'info',
+                            'LYRIA_GENERATION_COMPLETE',
+                            'Lyria music generation completed successfully.',
+                            { chunkCount, receivedBytes, sizeBytes: wavBlob.size },
+                        ),
+                    );
+                    resolve(buildGeneratedAssetResult('lyria', 'music', URL.createObjectURL(wavBlob), diagnostics));
                 }
             };
 
             // Stop generation after requested duration
-            setTimeout(() => {
+            stopTimer = setTimeout(() => {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ playbackControl: 'STOP' }));
                     ws.close();
@@ -716,7 +983,8 @@ export const generateMusic = async (moodDescription: string, durationSeconds: nu
             if (!hasResolved) {
                 hasResolved = true;
                 clearTimeout(safetyTimeout);
-                resolve(triggerFallback(`Exception: ${e}`));
+                if (stopTimer) clearTimeout(stopTimer);
+                resolve(triggerFallback(`Exception: ${toErrorMessage(e)}`, "LYRIA_EXCEPTION", "error", e));
             }
         }
     });

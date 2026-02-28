@@ -171,3 +171,85 @@ test('runGenerationPipeline throws PipelineCancelledError when cancelled', async
         return true;
     });
 });
+
+test('runGenerationPipeline surfaces structured provider diagnostics in logs and issues', async () => {
+    const harness = createProjectHarness();
+    const plan = makePlan();
+
+    const result = await runGenerationPipeline({
+        prompt: 'Create a campaign',
+        settings: baseSettings,
+        files: [],
+        preferredVoice: TTSVoice.Kore,
+        onProjectInitialized: harness.onProjectInitialized,
+        onProjectUpdate: harness.onProjectUpdate,
+        onLog: harness.onLog,
+        deps: {
+            generateAdPlan: async () => plan,
+            generateStoryboardImage: async (scene) => ({
+                provider: 'gemini',
+                operation: 'storyboard',
+                url: null,
+                diagnostics: [
+                    {
+                        level: 'error',
+                        code: 'GEMINI_STORYBOARD_REQUEST_FAILED',
+                        message: `Scene ${scene.id} storyboard failed due to quota.`,
+                        context: { sceneId: scene.id, providerStatus: 429 },
+                        error: new Error('Quota exceeded'),
+                    },
+                ],
+            }),
+            generateVideoClip: async () => 'blob:video.mp4',
+            generateVoiceover: async () => 'blob:voiceover.wav',
+            generateMusic: async () => 'blob:music.wav',
+        },
+    });
+
+    assert.equal(result.project.currentPhase, 'ready');
+    assert.ok(result.issues.some(issue => issue.stage === 'storyboarding' && issue.message.includes('quota')));
+    assert.ok(result.issues.some(issue => issue.error?.message.includes('Quota exceeded')));
+    assert.ok(
+        harness
+            .getLogs()
+            .some(log => log.stage === 'storyboarding' && log.message.includes('GEMINI_STORYBOARD_REQUEST_FAILED')),
+    );
+});
+
+test('runGenerationPipeline flags fallback music as recoverable issue', async () => {
+    const harness = createProjectHarness();
+    const plan = makePlan();
+
+    const result = await runGenerationPipeline({
+        prompt: 'Create a campaign',
+        settings: baseSettings,
+        files: [],
+        preferredVoice: TTSVoice.Kore,
+        onProjectInitialized: harness.onProjectInitialized,
+        onProjectUpdate: harness.onProjectUpdate,
+        onLog: harness.onLog,
+        deps: {
+            generateAdPlan: async () => plan,
+            generateStoryboardImage: async () => 'data:image/png;base64,abc',
+            generateVideoClip: async () => 'blob:scene.mp4',
+            generateVoiceover: async () => 'blob:voiceover.wav',
+            generateMusic: async () => ({
+                provider: 'lyria',
+                operation: 'music',
+                url: 'https://example.com/fallback-track.mp3',
+                fallbackUsed: true,
+                diagnostics: [
+                    {
+                        level: 'error',
+                        code: 'LYRIA_SOCKET_ERROR',
+                        message: 'WebSocket connection failed.',
+                    },
+                ],
+            }),
+        },
+    });
+
+    assert.equal(result.musicUrl, 'https://example.com/fallback-track.mp3');
+    assert.ok(result.issues.some(issue => issue.stage === 'scoring' && issue.message.includes('fallback track')));
+    assert.ok(harness.getLogs().some(log => log.stage === 'scoring' && log.level === 'warn'));
+});

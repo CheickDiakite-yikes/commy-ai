@@ -37,6 +37,20 @@ export interface GenerationPipelineDependencies {
   generateMusic: typeof GeminiService.generateMusic;
 }
 
+interface NormalizedProviderDiagnostic {
+  level: PipelineLogLevel;
+  code?: string;
+  message: string;
+  context?: Record<string, unknown>;
+  error?: SerializedPipelineError;
+}
+
+interface NormalizedAssetResult {
+  url: string | null;
+  fallbackUsed: boolean;
+  diagnostics: NormalizedProviderDiagnostic[];
+}
+
 export interface GenerationPipelineOptions {
   prompt: string;
   settings: ProjectSettings;
@@ -111,6 +125,45 @@ const toSerializedError = (error: unknown): SerializedPipelineError => {
   }
 };
 
+const toPipelineLevel = (level: unknown): PipelineLogLevel => {
+  if (level === "error" || level === "warn" || level === "info") return level;
+  return "info";
+};
+
+const normalizeAssetResult = (value: unknown): NormalizedAssetResult => {
+  if (typeof value === "string") {
+    return { url: value, fallbackUsed: false, diagnostics: [] };
+  }
+  if (!value || typeof value !== "object") {
+    return { url: null, fallbackUsed: false, diagnostics: [] };
+  }
+
+  const maybeResult = value as GeminiService.GeneratedAssetResult;
+  const url = typeof maybeResult.url === "string" ? maybeResult.url : null;
+  const fallbackUsed = Boolean(maybeResult.fallbackUsed);
+  const diagnostics = Array.isArray(maybeResult.diagnostics)
+    ? maybeResult.diagnostics.map((entry) => ({
+        level: toPipelineLevel(entry.level),
+        code: entry.code,
+        message: entry.message,
+        context: entry.context,
+        error: entry.error
+          ? isSerializedPipelineError(entry.error)
+            ? entry.error
+            : toSerializedError(entry.error)
+          : undefined,
+      }))
+    : [];
+
+  return { url, fallbackUsed, diagnostics };
+};
+
+const selectPrimaryDiagnostic = (
+  diagnostics: NormalizedProviderDiagnostic[],
+): NormalizedProviderDiagnostic | undefined =>
+  diagnostics.find((entry) => entry.level === "error") ??
+  diagnostics.find((entry) => entry.level === "warn");
+
 export const runGenerationPipeline = async (
   options: GenerationPipelineOptions,
 ): Promise<GenerationPipelineRunResult> => {
@@ -156,6 +209,19 @@ export const runGenerationPipeline = async (
       issue.sceneId ? { sceneId: issue.sceneId } : undefined,
       issue.error,
     );
+  };
+
+  const emitProviderDiagnostics = (
+    stage: PipelineStage,
+    diagnostics: NormalizedProviderDiagnostic[],
+    baseContext?: Record<string, unknown>,
+  ) => {
+    diagnostics.forEach((entry) => {
+      const mergedContext =
+        baseContext || entry.context ? { ...(baseContext || {}), ...(entry.context || {}) } : undefined;
+      const message = entry.code ? `[${entry.code}] ${entry.message}` : entry.message;
+      pushLog(entry.level, stage, message, mergedContext, entry.error);
+    });
   };
 
   const updateProject = (nextProject: AdProject) => {
@@ -209,11 +275,16 @@ export const runGenerationPipeline = async (
     });
 
     try {
-      const storyboardUrl = await deps.generateStoryboardImage(
-        scene,
-        options.settings.aspectRatio,
-        options.visualAnchorDataUrl,
+      const storyboardResult = normalizeAssetResult(
+        await deps.generateStoryboardImage(
+          scene,
+          options.settings.aspectRatio,
+          options.visualAnchorDataUrl,
+        ),
       );
+      emitProviderDiagnostics("storyboarding", storyboardResult.diagnostics, { sceneId: scene.id });
+      const storyboardUrl = storyboardResult.url;
+      const failureDiagnostic = selectPrimaryDiagnostic(storyboardResult.diagnostics);
       const nextScene = {
         ...scene,
         storyboardUrl: storyboardUrl || undefined,
@@ -224,8 +295,11 @@ export const runGenerationPipeline = async (
         addIssue({
           stage: "storyboarding",
           sceneId: scene.id,
-          message: "Storyboard generation returned no image. Continuing with fallback flow.",
+          message: failureDiagnostic
+            ? `Storyboard generation returned no image. ${failureDiagnostic.message}`
+            : "Storyboard generation returned no image. Continuing with fallback flow.",
           recoverable: true,
+          error: failureDiagnostic?.error,
         });
       } else {
         pushLog("info", "storyboarding", "Storyboard generated.", {
@@ -291,11 +365,16 @@ export const runGenerationPipeline = async (
     });
 
     try {
-      const videoUrl = await deps.generateVideoClip(
-        scene,
-        options.settings.aspectRatio,
-        scene.storyboardUrl,
+      const videoResult = normalizeAssetResult(
+        await deps.generateVideoClip(
+          scene,
+          options.settings.aspectRatio,
+          scene.storyboardUrl,
+        ),
       );
+      emitProviderDiagnostics("video_production", videoResult.diagnostics, { sceneId: scene.id });
+      const videoUrl = videoResult.url;
+      const failureDiagnostic = selectPrimaryDiagnostic(videoResult.diagnostics);
       const nextScene: Scene = {
         ...scene,
         videoUrl: videoUrl || undefined,
@@ -307,10 +386,18 @@ export const runGenerationPipeline = async (
         addIssue({
           stage: "video_production",
           sceneId: scene.id,
-          message: "Video generation returned no output.",
+          message: failureDiagnostic
+            ? `Video generation returned no output. ${failureDiagnostic.message}`
+            : "Video generation returned no output.",
           recoverable: true,
+          error: failureDiagnostic?.error,
         });
       } else {
+        if (videoResult.fallbackUsed) {
+          pushLog("warn", "video_production", "Video generation used a fallback mode.", {
+            sceneId: scene.id,
+          });
+        }
         pushLog("info", "video_production", "Video clip generated.", {
           sceneId: scene.id,
         });
@@ -354,14 +441,20 @@ export const runGenerationPipeline = async (
 
   let voiceoverUrl: string | undefined;
   try {
-    voiceoverUrl =
-      (await deps.generateVoiceover(plan.fullScript, options.preferredVoice, plan.script)) ||
-      undefined;
+    const voiceoverResult = normalizeAssetResult(
+      await deps.generateVoiceover(plan.fullScript, options.preferredVoice, plan.script),
+    );
+    emitProviderDiagnostics("voiceover", voiceoverResult.diagnostics);
+    const failureDiagnostic = selectPrimaryDiagnostic(voiceoverResult.diagnostics);
+    voiceoverUrl = voiceoverResult.url || undefined;
     if (!voiceoverUrl) {
       addIssue({
         stage: "voiceover",
-        message: "Voiceover generation returned no audio.",
+        message: failureDiagnostic
+          ? `Voiceover generation returned no audio. ${failureDiagnostic.message}`
+          : "Voiceover generation returned no audio.",
         recoverable: true,
+        error: failureDiagnostic?.error,
       });
     } else {
       pushLog("info", "voiceover", "Voiceover generated.");
@@ -387,12 +480,29 @@ export const runGenerationPipeline = async (
 
   let musicUrl: string | undefined;
   try {
-    musicUrl = (await deps.generateMusic(plan.musicMood || options.settings.musicTheme)) || undefined;
+    const musicResult = normalizeAssetResult(
+      await deps.generateMusic(plan.musicMood || options.settings.musicTheme),
+    );
+    emitProviderDiagnostics("scoring", musicResult.diagnostics);
+    const failureDiagnostic = selectPrimaryDiagnostic(musicResult.diagnostics);
+    musicUrl = musicResult.url || undefined;
     if (!musicUrl) {
       addIssue({
         stage: "scoring",
-        message: "Music generation returned no audio.",
+        message: failureDiagnostic
+          ? `Music generation returned no audio. ${failureDiagnostic.message}`
+          : "Music generation returned no audio.",
         recoverable: true,
+        error: failureDiagnostic?.error,
+      });
+    } else if (musicResult.fallbackUsed) {
+      addIssue({
+        stage: "scoring",
+        message: failureDiagnostic
+          ? `Music generation used fallback track. ${failureDiagnostic.message}`
+          : "Music generation used fallback track.",
+        recoverable: true,
+        error: failureDiagnostic?.error,
       });
     } else {
       pushLog("info", "scoring", "Music generated.");

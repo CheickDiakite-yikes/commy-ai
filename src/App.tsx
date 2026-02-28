@@ -6,6 +6,26 @@ import { ArrowUpCircle, Film, Layers, Settings, FileText, Music, Mic, X, Plus, P
 import { stitchProject } from './utils/ffmpegStitcher';
 import { PipelineCancelledError, PipelineLogEntry, runGenerationPipeline } from './services/generationPipeline';
 
+const serializeLogContextValue = (value: unknown): string => {
+    if (typeof value === 'string') return value.length > 120 ? `${value.slice(0, 117)}...` : value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    try {
+        const serialized = JSON.stringify(value);
+        return serialized.length > 120 ? `${serialized.slice(0, 117)}...` : serialized;
+    } catch {
+        return '[unserializable]';
+    }
+};
+
+const formatLogContext = (context?: Record<string, unknown>): string | null => {
+    if (!context) return null;
+    const entries = Object.entries(context).filter(([, value]) => value !== undefined);
+    if (entries.length === 0) return null;
+    return entries.slice(0, 6).map(([key, value]) => `${key}=${serializeLogContextValue(value)}`).join(' | ');
+};
+
 // --- Reference Manager (Left Panel) ---
 const ReferenceManager: React.FC<{
     files: ReferenceFile[];
@@ -525,13 +545,13 @@ const ProjectBoard: React.FC<{
                                 Cancel Production
                             </button>
                             {latestPipelineLog && (
-                                <div className={`rounded-xl border p-3 text-left text-xs font-mono ${latestPipelineLog.level === 'error'
+                                    <div className={`rounded-xl border p-3 text-left text-xs font-mono ${latestPipelineLog.level === 'error'
                                         ? 'bg-red-50 border-red-200 text-red-700'
                                         : latestPipelineLog.level === 'warn'
                                             ? 'bg-amber-50 border-amber-200 text-amber-700'
                                             : 'bg-slate-50 border-slate-200 text-slate-600'
                                     }`}>
-                                    <div className="font-bold uppercase tracking-wide mb-1">{latestPipelineLog.stage.replace('_', ' ')}</div>
+                                    <div className="font-bold uppercase tracking-wide mb-1">{latestPipelineLog.stage.replace(/_/g, ' ')}</div>
                                     <div>{latestPipelineLog.message}</div>
                                 </div>
                             )}
@@ -642,8 +662,19 @@ const ProjectBoard: React.FC<{
                                                         : 'border-slate-200 bg-slate-50 text-slate-600'
                                                 }`}
                                         >
-                                            <div className="font-mono font-semibold uppercase tracking-wide">{entry.stage.replace('_', ' ')}</div>
+                                            <div className="font-mono font-semibold uppercase tracking-wide">{entry.stage.replace(/_/g, ' ')}</div>
                                             <div className="mt-1">{entry.message}</div>
+                                            {entry.error && (
+                                                <div className="mt-2 rounded-md border border-current/20 bg-white/50 px-2 py-1 text-[10px] font-mono">
+                                                    <div className="font-semibold">Error: {entry.error.message}</div>
+                                                    {entry.error.cause && <div className="mt-1">Cause: {entry.error.cause}</div>}
+                                                </div>
+                                            )}
+                                            {formatLogContext(entry.context) && (
+                                                <div className="mt-2 text-[10px] font-mono opacity-80 break-all">
+                                                    {formatLogContext(entry.context)}
+                                                </div>
+                                            )}
                                         </div>
                                     ))}
                                 </div>
