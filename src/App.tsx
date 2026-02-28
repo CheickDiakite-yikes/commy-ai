@@ -5,6 +5,12 @@ import * as ApiClient from './services/apiClient';
 import { ArrowUpCircle, Film, Layers, Settings, FileText, Music, Mic, X, Plus, Play, Download, MessageSquare, Loader2, Pause, CheckCircle2, Menu, ImagePlus, User, Eye, Sparkles, Paperclip, FileImage, FileVideo, Link as LinkIcon, Youtube, Image as ImageIcon, VenetianMask, Palette, Video, Camera, Shirt, Sun, ChevronDown, ChevronUp } from 'lucide-react';
 import { stitchProject } from './utils/ffmpegStitcher';
 import { PipelineCancelledError, PipelineLogEntry, runGenerationPipeline } from './services/generationPipeline';
+import {
+    hasDirectorContent,
+    hasPersistentMedia,
+    sanitizeProjectMediaForReload,
+    shouldReplaceWithBackendSnapshot,
+} from './utils/projectPersistence';
 
 const serializeLogContextValue = (value: unknown): string => {
     if (typeof value === 'string') return value.length > 120 ? `${value.slice(0, 117)}...` : value;
@@ -1042,21 +1048,21 @@ export const App: React.FC = () => {
         if (saved) {
             try {
                 const parsed = JSON.parse(saved);
-                // Clear blob URLs as they are invalid across sessions
-                parsed.voiceoverUrl = undefined;
-                parsed.musicUrl = undefined;
-                parsed.scenes.forEach((s: any) => {
-                    s.videoUrl = undefined;
-                    s.storyboardUrl = undefined;
-                });
-
-                // CRITICAL FIX: Never restore a stuck generation state across reloads
-                parsed.isGenerating = false;
-                if (parsed.currentPhase !== 'ready') {
-                    parsed.currentPhase = 'planning';
+                const { project: sanitized, clearedCount, retainedCount } = sanitizeProjectMediaForReload(parsed);
+                if (clearedCount > 0 || retainedCount > 0) {
+                    console.log('🧹 Restored project from local cache with media URL sanitization', {
+                        clearedEphemeralUrls: clearedCount,
+                        retainedPersistentUrls: retainedCount,
+                    });
                 }
 
-                return parsed;
+                // CRITICAL FIX: Never restore a stuck generation state across reloads
+                sanitized.isGenerating = false;
+                if (sanitized.currentPhase !== 'ready') {
+                    sanitized.currentPhase = 'planning';
+                }
+
+                return sanitized;
             } catch (e) {
                 return null;
             }
@@ -1125,22 +1131,59 @@ export const App: React.FC = () => {
 
     // Check backend availability and load persisted project on mount
     useEffect(() => {
+        let cancelled = false;
         const initBackend = async () => {
             const available = await ApiClient.checkBackendAvailable();
-            if (available && !project) {
-                const loaded = await ApiClient.loadLatestProject();
-                if (loaded) {
-                    // CRITICAL FIX: Never restore a stuck generation state from the DB
-                    loaded.isGenerating = false;
-                    if (loaded.currentPhase !== 'ready') {
-                        loaded.currentPhase = 'planning';
-                    }
-                    console.log('📂 Loaded project from database:', loaded.title);
-                    setProject(loaded);
-                }
+            if (!available || cancelled) return;
+
+            const loaded = await ApiClient.loadLatestProject();
+            if (!loaded || cancelled) return;
+
+            // CRITICAL FIX: Never restore a stuck generation state from the DB
+            loaded.isGenerating = false;
+            if (loaded.currentPhase !== 'ready') {
+                loaded.currentPhase = 'planning';
             }
+
+            setProject((currentProject) => {
+                if (!currentProject) {
+                    console.log('📂 Loaded project from database (no local project found):', loaded.title);
+                    return loaded;
+                }
+
+                const currentHasPersistentMedia = hasPersistentMedia(currentProject);
+                const loadedHasPersistentMedia = hasPersistentMedia(loaded);
+                const currentHasDirectorData = hasDirectorContent(currentProject);
+                const loadedHasDirectorData = hasDirectorContent(loaded);
+                const shouldReplaceWithBackend = shouldReplaceWithBackendSnapshot(currentProject, loaded);
+
+                if (shouldReplaceWithBackend) {
+                    console.log('📂 Loaded richer backend project snapshot after refresh', {
+                        currentHasPersistentMedia,
+                        loadedHasPersistentMedia,
+                        currentHasDirectorData,
+                        loadedHasDirectorData,
+                        currentPhase: currentProject.currentPhase,
+                        loadedPhase: loaded.currentPhase,
+                    });
+                    return loaded;
+                }
+
+                console.log('📂 Kept local project snapshot after backend check', {
+                    currentHasPersistentMedia,
+                    loadedHasPersistentMedia,
+                    currentHasDirectorData,
+                    loadedHasDirectorData,
+                    currentPhase: currentProject.currentPhase,
+                    loadedPhase: loaded.currentPhase,
+                });
+                return currentProject;
+            });
         };
         initBackend();
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     const appendPipelineLog = useCallback((entry: PipelineLogEntry) => {
@@ -1199,27 +1242,35 @@ export const App: React.FC = () => {
 
             if (ApiClient.isBackendAvailable()) {
                 try {
-                    const dbId = await ApiClient.saveProjectState({
+                    const persisted = await ApiClient.saveProjectState({
                         ...run.plan,
                         mode: settings.mode,
                         scenes: run.scenes,
                     }, settings);
 
-                    if (dbId) {
+                    if (persisted?.projectId) {
                         for (const scene of run.scenes) {
+                            const dbSceneId = persisted.sceneDbIdsByOrder[scene.order] || scene.id;
+                            if (!persisted.sceneDbIdsByOrder[scene.order]) {
+                                pushManualPipelineLog({
+                                    stage: 'ready',
+                                    level: 'warn',
+                                    message: `No DB scene mapping found for scene order ${scene.order}; using source scene id.`,
+                                });
+                            }
                             if (scene.storyboardUrl) {
-                                await ApiClient.uploadSceneMedia(scene.id, scene.storyboardUrl, 'storyboard', 'image/png');
+                                await ApiClient.uploadSceneMedia(dbSceneId, scene.storyboardUrl, 'storyboard', 'image/png');
                             }
                             if (scene.videoUrl) {
-                                await ApiClient.uploadSceneMedia(scene.id, scene.videoUrl, 'video', 'video/mp4');
+                                await ApiClient.uploadSceneMedia(dbSceneId, scene.videoUrl, 'video', 'video/mp4');
                             }
                         }
 
                         if (run.voiceoverUrl && (run.voiceoverUrl.startsWith('blob:') || run.voiceoverUrl.startsWith('data:'))) {
-                            await ApiClient.uploadProjectAsset(dbId, run.voiceoverUrl, 'voiceover', 'audio/wav');
+                            await ApiClient.uploadProjectAsset(persisted.projectId, run.voiceoverUrl, 'voiceover', 'audio/wav');
                         }
                         if (run.musicUrl && (run.musicUrl.startsWith('blob:') || run.musicUrl.startsWith('data:'))) {
-                            await ApiClient.uploadProjectAsset(dbId, run.musicUrl, 'music', 'audio/wav');
+                            await ApiClient.uploadProjectAsset(persisted.projectId, run.musicUrl, 'music', 'audio/wav');
                         } else if (run.musicUrl) {
                             pushManualPipelineLog({
                                 stage: 'scoring',

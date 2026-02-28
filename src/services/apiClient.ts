@@ -58,6 +58,11 @@ export const checkBackendAvailable = async (): Promise<boolean> => {
 
 export const isBackendAvailable = () => _backendAvailable === true;
 
+// Test-only utility to reset cached backend availability between unit tests.
+export const resetBackendAvailabilityForTests = () => {
+    _backendAvailable = null;
+};
+
 /**
  * Convert a backend relative path to a full URL 
  */
@@ -213,11 +218,19 @@ export const uploadProjectAsset = async (
     }
 };
 
+export interface SaveProjectStateResult {
+    projectId: string;
+    sceneDbIdsByOrder: Record<number, string>;
+}
+
 /**
  * Save the entire project state to the backend.
  * Called after generation phases complete.
  */
-export const saveProjectState = async (project: any, settings?: any): Promise<string | null> => {
+export const saveProjectState = async (
+    project: any,
+    settings?: any,
+): Promise<SaveProjectStateResult | null> => {
     if (!isBackendAvailable()) return null;
 
     try {
@@ -250,8 +263,22 @@ export const saveProjectState = async (project: any, settings?: any): Promise<st
             console.error('Failed to save project to database:', result.error);
             return null;
         }
-        console.log('💾 Project saved to database:', result.id);
-        return result.id;
+        const sceneDbIdsByOrder: Record<number, string> = {};
+        if (Array.isArray(result?.scenes)) {
+            for (const scene of result.scenes) {
+                if (typeof scene?.scene_order === 'number' && typeof scene?.id === 'string') {
+                    sceneDbIdsByOrder[scene.scene_order] = scene.id;
+                }
+            }
+        }
+
+        console.log('💾 Project saved to database:', result.id, {
+            mappedSceneCount: Object.keys(sceneDbIdsByOrder).length,
+        });
+        return {
+            projectId: result.id,
+            sceneDbIdsByOrder,
+        };
     } catch (err) {
         console.error('Failed to save project to database:', err);
         return null;
